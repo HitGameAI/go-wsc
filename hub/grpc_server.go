@@ -479,7 +479,7 @@ func (h *Hub) startNodeGRPC() {
 	// 配置端口为 0（随机端口）时，listener 绑定后才知实际端口；
 	// Register 写入 Redis 和 GetNodeAddr 返回本节点地址都需用实际地址
 	if server.listener != nil {
-		h.nodeRegistry.SetGRPCAddr(server.listener.Addr().String())
+		h.nodeRegistry.SetGRPCAddr(resolveAdvertisedGRPCAddr(server.listener.Addr().String()))
 	}
 
 	// 2. 注册本节点到 Redis 节点发现表
@@ -497,6 +497,26 @@ func (h *Hub) startNodeGRPC() {
 		})
 
 	h.logger.InfoKV("🔗 节点 gRPC 服务已启动", "node_id", h.nodeID, "addr", grpcAddr)
+}
+
+// resolveAdvertisedGRPCAddr 将监听地址转换为可对外路由的注册地址
+//
+// 监听通配地址（:port / 0.0.0.0:port）时 listener.Addr 返回 [::]:port，
+// 该形式仅可用于 bind 不可用于 connect，远端节点 dial 会回环到自身导致跨节点投递失效；
+// 通配 host 替换为本机私网 IP（容器/K8s 环境即 Pod IP），端口保留 listener 实际绑定值
+func resolveAdvertisedGRPCAddr(listenAddr string) string {
+	host, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return listenAddr
+	}
+	if host != "" && host != "0.0.0.0" && host != "::" {
+		return listenAddr
+	}
+	ip, err := netx.GetPrivateIP()
+	if err != nil {
+		return listenAddr
+	}
+	return net.JoinHostPort(ip, port)
 }
 
 // stopNodeGRPC 停止节点间 gRPC 通信组件

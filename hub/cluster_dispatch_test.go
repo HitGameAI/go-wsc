@@ -28,6 +28,7 @@ import (
 	"time"
 
 	wscconfig "github.com/kamalyes/go-config/pkg/wsc"
+	"github.com/kamalyes/go-toolbox/pkg/netx"
 	"github.com/kamalyes/go-wsc/cluster"
 	"github.com/kamalyes/go-wsc/constants"
 	"github.com/kamalyes/go-wsc/models"
@@ -147,6 +148,22 @@ func TestDispatchViaGRPCEnvelopeNormalization(t *testing.T) {
 	require.Len(t, mock.captured, 1)
 	assert.Equal(t, "tenant-a", mock.captured[0],
 		"gRPC metadata 应携带归一化后的 msg.AppID，而非空/DefaultAppID")
+}
+
+// TestResolveAdvertisedGRPCAddr 验证通配监听地址被转换为本机私网 IP 的可路由注册地址
+// （[::]:port 不可 dial，远端节点以此注册地址直连会回环到自身导致跨节点投递失效）
+func TestResolveAdvertisedGRPCAddr(t *testing.T) {
+	// 显式绑定具体地址：原样返回
+	assert.Equal(t, "10.0.0.1:50052", resolveAdvertisedGRPCAddr("10.0.0.1:50052"))
+
+	// 通配地址（listener.Addr 的 [::]:port 与裸 :port）：替换为本机私网 IP，端口保留
+	privateIP, err := netx.GetPrivateIP()
+	if err != nil {
+		t.Skipf("测试环境无私网 IP，跳过通配地址转换断言: %v", err)
+	}
+	assert.Equal(t, privateIP+":50052", resolveAdvertisedGRPCAddr("[::]:50052"))
+	assert.Equal(t, privateIP+":50052", resolveAdvertisedGRPCAddr(":50052"))
+	assert.Equal(t, privateIP+":50052", resolveAdvertisedGRPCAddr("0.0.0.0:50052"))
 }
 
 // TestDispatchViaGRPCEnvelopeAppIDDelegate msg 信封无 appID 时回退 opts.AppID，

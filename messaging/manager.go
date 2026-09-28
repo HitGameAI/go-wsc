@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 
 	"github.com/kamalyes/go-toolbox/pkg/syncx"
+	"github.com/kamalyes/go-wsc/connection"
 	"github.com/kamalyes/go-wsc/models"
 	"github.com/kamalyes/go-wsc/spi"
 )
@@ -64,6 +65,8 @@ type Manager struct {
 	replayGate *replayGate
 	// idGenerator 消息 ID 生成器（雪花 ID）
 	idGenerator models.IDGenerator
+	// controlLane 控制通道投递器（pong 等控制类消息直达，CtrlCh 满时回退数据 lane）
+	controlLane *connection.ControlLane
 
 	// ========== 应用层回调 ==========
 
@@ -83,7 +86,7 @@ type Manager struct {
 
 // NewManager 创建消息域管理器
 func NewManager(host Host) *Manager {
-	return &Manager{host: host}
+	return &Manager{host: host, controlLane: connection.NewControlLane(host.GetLogger())}
 }
 
 // ============================================================================

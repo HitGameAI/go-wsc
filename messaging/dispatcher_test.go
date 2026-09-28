@@ -310,6 +310,31 @@ func TestMessageHandlerTextHeartbeat(t *testing.T) {
 	}
 }
 
+// TestHeartbeatPongResponse 验证应用层 ping 消息经保活续期后回写 pong 响应
+func TestHeartbeatPongResponse(t *testing.T) {
+	m, _ := newTestManager()
+
+	client := makeTestClient("c-pong", "u-pong")
+	pingMsg := models.NewHubMessage().SetMessageType(models.MessageTypePing)
+	data := mustMarshalHubMessage(t, pingMsg)
+
+	m.handleTextMessage(context.Background(), client, data)
+
+	// CtrlCh 未初始化时 pong 走控制 lane 的数据 lane 回退（SendChan）
+	select {
+	case raw := <-client.SendChan:
+		var pong models.HubMessage
+		require.NoError(t, json.Unmarshal(raw, &pong))
+		assert.Equal(t, models.MessageTypePong, pong.MessageType, "应回写 pong 消息")
+		assert.Equal(t, "u-pong", pong.Receiver, "pong 应回填接收方")
+		assert.NotEmpty(t, pong.ID, "pong ID 应由 idGenerator 生成")
+	case <-time.After(time.Second):
+		t.Fatal("应用层 ping 后应在数据 lane 收到 pong 响应")
+	}
+
+	assert.False(t, client.GetLastPong().IsZero(), "pong 送达后应刷新 LastPong")
+}
+
 // TestMessageHandlerTextNonForwardable 验证普通文本消息触发接收回调
 func TestMessageHandlerTextNonForwardable(t *testing.T) {
 	m, _ := newTestManager()

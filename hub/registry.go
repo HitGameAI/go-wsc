@@ -11,8 +11,8 @@
  * shardedRegistry 分片锁；心跳（时间轮 O(1) 超时 + SSE 兜底扫描）、
  * 多端登录治理、踢出断链与连接记录已域化下沉至 connection.HeartbeatManager /
  * LifecycleManager / RecordManager，此处经 heartbeatMgr / lifecycleMgr /
- * recordMgr 委托。
- * 读写泵与协议级 PING 处理已由 transport/messaging 域接管，此处不迁移。
+ * recordMgr 委托。读写泵与协议级 PING 处理由消息域提供（StartClientPumps），
+ * 注册临界区后统一启动，本层仅做接线。
  *
  * Copyright (c) 2026 by kamalyes, All Rights Reserved.
  */
@@ -43,6 +43,9 @@ func (h *Hub) Register(client *models.Client) {
 		"client_id", client.ID,
 		"user_id", client.UserID,
 	)
+	// 通道四件套同步初始化（升级器已预初始化时幂等跳过）：必须先于后台注册 goroutine，
+	// 否则传输域紧随 Register 调用的 SendRegisteredMessage 会因 SendChan 未就绪被静默丢弃
+	h.chanPool.InitClientSendChan(client)
 	// 注册任务计入 h.wg：SafeShutdown 的 h.wg.Wait() 需等待在途注册完成，
 	// 避免半注册连接在 shutdown 批量清理后才加入注册表造成泄漏
 	h.wg.Add(1)
@@ -57,6 +60,8 @@ func (h *Hub) RegisterSync(client *models.Client) {
 	if client == nil {
 		return
 	}
+	// 通道四件套同步初始化（与 Register 入口一致，幂等）
+	h.chanPool.InitClientSendChan(client)
 	h.handleRegister(client)
 }
 
@@ -166,6 +171,17 @@ func (h *Hub) handleRegister(client *models.Client) {
 	// ⏰ 在时间轮上调度心跳超时任务（仅 WebSocket；SSE 由心跳管理器兜底扫描）
 	h.heartbeatMgr.ScheduleTimeout(client)
 
+	// 👥 连接注册时自动入组（群组域）：系统组（按用户类型）+ 成员组（client.GetGroupIDs()，
+	// 业务组自动创建；GroupStore 未注入时内部判空降级）。置于泵启动前保证群组投递可见时
+	// 成员关系已就绪，消除"连接已注册但群组查无此人"的漏投窗口
+	h.groupLifecycleMgr.JoinSystemGroupsOnConnect(client.Context, client)
+	h.groupLifecycleMgr.JoinMemberGroupOnConnect(client.Context, client)
+
+	// 🚀 启动读写泵 + 协议级 PING 处理器（消息域 StartClientPumps）：AddClient 后投递者
+	// 已可见该连接，消费者须尽快就绪；泵启动前到达的消息由 SendChan 缓冲吸收，
+	// 启动后由写泵排空（注册入口已同步初始化四件套，SSE 在 StartClientPumps 内短路）
+	h.messagingMgr.StartClientPumps(client)
+
 	// ================================================================
 	// 非临界区 - IO 操作异步执行（WorkerPool 控制并发）
 	// ================================================================
@@ -271,6 +287,11 @@ func (h *Hub) handleUnregister(client *models.Client) {
 	// Phase 2: 关闭通道与连接（幂等，重复调用无副作用）
 	h.lifecycleMgr.CloseChannel(client)
 	h.lifecycleMgr.CloseConnection(client)
+
+	// 👥 断开时自动离开系统保留组（群组域）：多端登录保护——仅当该 userID 已无任何在线
+	// 连接时才离组（Phase 1 已移除当前连接，HasUser 查询的即"移除后"状态）；
+	// 成员组不随连接断开清除（群组成员为持久关系，离线成员走群组可靠投递转存）
+	h.groupLifecycleMgr.LeaveSystemGroupsOnDisconnect(ctx, client)
 
 	h.logger.InfoContextKV(ctx, "客户端断开连接",
 		"client_id", client.ID,

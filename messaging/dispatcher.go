@@ -44,6 +44,36 @@ const clientWriteBatchSize = 64
 // clientWriteTimeout 单条消息写入的超时时间
 const clientWriteTimeout = 10 * time.Second
 
+// StartClientPumps 启动客户端读写泵并安装协议级 PING 处理器（编排层注册路径调用）
+// 在注册临界区后调用：此后 socket 有了唯一读者（读泵）与唯一写者（写泵），
+// 泵启动前到达的消息由注册入口初始化的 SendChan 缓冲吸收，启动后排空，无丢失。
+// SSE 连接短路返回：SSE 无 gorilla 连接语义，写由 SSE 专用通道驱动（见 transport/sse.go）
+func (m *Manager) StartClientPumps(client *models.Client) {
+	if client == nil || client.Conn == nil || client.ConnectionType == models.ConnectionTypeSSE {
+		return
+	}
+	// 安装顺序必须是 PING 处理器先于读写泵（单写者模式，见 setupPingHandler 注释）
+	m.setupPingHandler(client)
+	go m.handleClientWrite(client)
+	go m.handleClientRead(client)
+}
+
+// setupPingHandler 安装协议级 PING 处理器（gorilla 单写者模式，必须先于读写泵启动）
+// 协议级 PING 与应用层心跳共用同一保活入口（HandleHeartbeat：内存时间戳 + 时间轮续期 + Redis 续期），
+// pong 一律经 PongCh 交给写泵统一写出——多协程并发写 Conn 会破坏 gorilla 帧序列
+func (m *Manager) setupPingHandler(client *models.Client) {
+	client.Conn.SetPingHandler(func(appData string) error {
+		m.host.HandleHeartbeat(client)
+		if client.PongCh != nil {
+			select {
+			case client.PongCh <- []byte(appData):
+			default: // 上一个 pong 尚未被写泵写出，丢弃（客户端超时会重发 PING）
+			}
+		}
+		return nil
+	})
+}
+
 // handleClientWrite 处理客户端消息写入
 func (m *Manager) handleClientWrite(client *models.Client) {
 	m.wg.Add(1)
@@ -223,7 +253,7 @@ func (m *Manager) handleTextMessage(ctx context.Context, client *models.Client, 
 	if err := json.Unmarshal(data, &probe); err == nil {
 		switch probe.MessageType {
 		case models.MessageTypePing, models.MessageTypeHeartbeat:
-			m.host.HandleHeartbeat(client)
+			m.handleHeartbeatMessage(client)
 			return
 		case models.MessageTypeAck:
 			if m.host.GetConfig().EnableAck && m.ackManager != nil {
@@ -254,7 +284,7 @@ func (m *Manager) handleTextMessage(ctx context.Context, client *models.Client, 
 	switch msg.MessageType {
 	case models.MessageTypePing, models.MessageTypeHeartbeat:
 		// 处理心跳/Ping消息（快路径未命中时兜底：探测失败但完整反序列化后是心跳，如含非标字段的畸形 JSON）
-		m.host.HandleHeartbeat(client)
+		m.handleHeartbeatMessage(client)
 		return
 	case models.MessageTypeAck:
 		// ACK消息由AckManager处理
@@ -309,6 +339,30 @@ func (m *Manager) handleTextMessage(ctx context.Context, client *models.Client, 
 			"error", err,
 		)
 	}
+}
+
+// handleHeartbeatMessage 处理应用层心跳/PING 消息：保活续期 + pong 响应
+// 协议级 PING 的 pong 控制帧由 setupPingHandler 投递 PongCh、写泵统一写出（本文件），
+// 此处仅响应应用层 ping 文本消息；快路径与完整反序列化兜底两分支统一走本方法
+func (m *Manager) handleHeartbeatMessage(client *models.Client) {
+	m.host.HandleHeartbeat(client)
+	if client == nil || client.IsClosed() {
+		return
+	}
+
+	pong := models.NewHubMessage().
+		SetMessageType(models.MessageTypePong).
+		SetReceiver(client.UserID).
+		SetReceiverType(client.UserType)
+	if m.idGenerator != nil {
+		pong.SetID(m.idGenerator.GenerateRequestID())
+	}
+
+	if !m.controlLane.SendControlMessage(client, pong) {
+		m.logWithClient(logger.DEBUG, "心跳 pong 双 lane 均满，丢弃本次响应", client)
+		return
+	}
+	client.SetLastPong(time.Now())
 }
 
 // handleForwardableMessage 处理可转发类型的消息（窗口消息、状态消息等）

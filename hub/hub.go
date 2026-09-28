@@ -74,6 +74,9 @@ type Hub struct {
 
 	// ========== 连接域 ==========
 	shardedRegistry *connection.ShardedRegistry
+	// chanPool 客户端通道池（SendChan/CtrlCh/PongCh/DoneCh 四件套初始化与回收复用）
+	// 注册入口同步初始化：消除传输域 Register 后立即发送注册确认与异步注册间的通道就绪竞态
+	chanPool *connection.ChanPool
 	// heartbeatMgr 心跳管理器（时间轮 O(1) 超时 + SSE 兜底扫描，时间轮为域内资产）
 	heartbeatMgr *connection.HeartbeatManager
 	// lifecycleMgr 连接生命周期管理器（多端登录治理 / 踢出断链 / 精简移除）
@@ -108,8 +111,10 @@ type Hub struct {
 	workerPool *messaging.HubWorkerPool
 
 	// ========== SPI 仓储（未注入即 nil，域内自行判空降级） ==========
-	messageSink            spi.MessageSink
-	groupStore             spi.GroupStore
+	messageSink spi.MessageSink
+	groupStore  spi.GroupStore
+	// groupLifecycleMgr 群组生命周期（连接注册/断开时的自动入组/离组接线在此驱动）
+	groupLifecycleMgr      *group.LifecycleManager
 	statsRepo              spi.HubStats
 	onlineStatusRepo       spi.OnlineStore
 	connectionStore        spi.ConnectionStore
@@ -229,6 +234,14 @@ func NewHub(config *wscconfig.WSC) *Hub {
 
 	// 分片注册表（替代单 mutex 的 clients/userToClients map）
 	hub.shardedRegistry = connection.NewShardedRegistry(config.EnableAgent, config.EnableObserver, registryCapacity)
+
+	// 群组生命周期管理器（连接注册时自动加入成员组/系统组，断开时多端保护离组；
+	// GroupStore 由 SPI 装配在 NewHub 之后注入，Join* 内部运行时判空降级，构造顺序无约束）
+	hub.groupLifecycleMgr = group.NewLifecycleManager(hub)
+
+	// 客户端通道池（连接域：配置缺失时 NewChanPool 内部走 DefaultClientCapacity；
+	// 升级器另注入 ChanPool 时注册入口的幂等初始化自动跳过，双路径互不冲突）
+	hub.chanPool = connection.NewChanPool(config.ClientCapacity, logger)
 
 	// ⏰ 心跳管理器（连接域：内存时间戳 + 时间轮 O(1) 超时 + SSE 兜底扫描）
 	// 构造期初始化时间轮，确保 Schedule/Refresh/Cancel 在任何 goroutine 启动前可用
