@@ -33,7 +33,9 @@ type ConnectionStore interface {
 	Upsert(ctx context.Context, record *models.ConnectionRecord) error
 
 	// MarkDisconnected 标记连接为已断开（写 duration/disconnected_at/is_abnormal 供质量终评读）
-	MarkDisconnected(ctx context.Context, connectionID string, reason models.DisconnectReason, code int) error
+	// connectedAt 由调用方从内存 Client 带入（省去一次 SELECT 查记录的开销，
+	// 断连风暴下每断一连接少 1 次 DB 往返）；记录不存在时实现方静默返回
+	MarkDisconnected(ctx context.Context, connectionID string, connectedAt time.Time, reason models.DisconnectReason, code int) error
 
 	// BatchUpdateHeartbeats 批量更新心跳时间戳（connect 表 last_ping_at/last_pong_at，单事务）
 	BatchUpdateHeartbeats(ctx context.Context, entries []*models.HeartbeatUpdateEntry) error

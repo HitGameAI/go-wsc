@@ -19,7 +19,9 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
+	"github.com/kamalyes/go-wsc/batcher"
 	"github.com/kamalyes/go-wsc/models"
 	"github.com/kamalyes/go-wsc/spi"
 	"github.com/stretchr/testify/assert"
@@ -60,7 +62,7 @@ func TestTrackMethodsNoOpWithoutBackends(t *testing.T) {
 	assert.NotPanics(t, func() {
 		m.TrackSenderMessageStats("conn-1", models.UserTypeCustomer)
 		m.TrackReceiverMessageStats("conn-1", models.UserTypeCustomer, 128)
-		m.TrackConnectionError(context.Background(), "conn-1", models.UserTypeCustomer, errors.New("boom"))
+		m.TrackConnectionError("conn-1", models.UserTypeCustomer, errors.New("boom"))
 		m.TrackHeartbeatStats(client)
 		m.TrackHeartbeatStats(nil)
 		m.SyncClientStats()
@@ -74,9 +76,14 @@ func TestTrackConnectionErrorIgnoresNilError(t *testing.T) {
 	host := newFakeHost()
 	quality := &recordingQualityStore{}
 	host.qualityRepo = quality
+	// 真实攒批器：拦截应发生在 Submit 之前，Stop flush 后落库条目为空
+	host.errBatcher = batcher.NewErrorStatsBatcher(host, 16, 8, time.Hour)
+	defer host.errBatcher.Stop()
 	m := NewManager(host)
 
-	m.TrackConnectionError(context.Background(), "conn-1", models.UserTypeCustomer, nil)
+	m.TrackConnectionError("conn-1", models.UserTypeCustomer, nil)
+	host.errBatcher.Stop()
+	host.errBatcher = nil // 防 defer 二次 Stop（幂等，双保险省略）
 	assert.Empty(t, quality.errors, "nil error 不应记录")
 }
 
@@ -102,7 +109,7 @@ func TestTrackErrorSkipsExcludedUserTypes(t *testing.T) {
 	for _, ut := range []models.UserType{
 		models.UserTypeSystem, models.UserTypeBot, models.UserTypeObserver,
 	} {
-		m.TrackConnectionError(context.Background(), "conn-x", ut, errors.New("boom"))
+		m.TrackConnectionError("conn-x", ut, errors.New("boom"))
 	}
 	assert.Empty(t, quality.errors, "系统/机器人/观察者不应记录错误")
 }
@@ -144,16 +151,16 @@ func TestSyncOnlineStatusToRedisWithoutBackendErrors(t *testing.T) {
 // 替身：嵌入接口 + 只覆盖用到的方法
 // ============================================================================
 
-// recordingQualityStore 记录 AddError 调用。
+// recordingQualityStore 记录 BatchAddErrors 调用。
 // 嵌入 spi.ConnectionQualityStore（nil）—— 未被覆盖的方法被调用即 panic，
 // 从而暴露本包对质量仓储的、测试尚未覆盖的依赖。
 type recordingQualityStore struct {
 	spi.ConnectionQualityStore
 
-	errors []error
+	errors []*models.ErrorUpdateEntry
 }
 
-func (s *recordingQualityStore) AddError(ctx context.Context, connectionID string, err error) error {
-	s.errors = append(s.errors, err)
+func (s *recordingQualityStore) BatchAddErrors(_ context.Context, entries []*models.ErrorUpdateEntry) error {
+	s.errors = append(s.errors, entries...)
 	return nil
 }

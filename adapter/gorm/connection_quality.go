@@ -198,22 +198,34 @@ func (r *ConnectionQualityStore) BatchIncrementStats(ctx context.Context, entrie
 	})
 }
 
-// AddError 记录错误
-func (r *ConnectionQualityStore) AddError(ctx context.Context, connectionID string, err error) error {
-	if err == nil {
+// BatchAddErrors 批量记录连接错误（单事务）
+// 同一连接的多次错误已由 batcher 在 flush 时合并（ErrorCount 为合并次数，LastError/LastErrorAt 为最新一次）；
+// 单条失败跳过（与 BatchIncrementStats 同语义），断连风暴下 N 次错误合并为 1 次事务
+func (r *ConnectionQualityStore) BatchAddErrors(ctx context.Context, entries []*models.ErrorUpdateEntry) error {
+	if len(entries) == 0 {
 		return nil
 	}
 
-	now := time.Now()
-	updates := map[string]any{
-		"error_count":   gorm.Expr("error_count + ?", 1),
-		"last_error":    err.Error(),
-		"last_error_at": now,
-	}
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		query := tx
+		if r.tableName != "" {
+			query = tx.Table(r.tableName)
+		} else {
+			query = tx.Model(&models.ConnectionQuality{})
+		}
 
-	return r.getDB(ctx).
-		Where("connection_id = ?", connectionID).
-		Updates(updates).Error
+		for _, entry := range entries {
+			updates := map[string]any{
+				"error_count":   gorm.Expr("error_count + ?", entry.ErrorCount),
+				"last_error":    entry.LastError,
+				"last_error_at": entry.LastErrorAt,
+			}
+			if err := query.Where("connection_id = ?", entry.ConnectionID).Updates(updates).Error; err != nil {
+				continue
+			}
+		}
+		return nil
+	})
 }
 
 // FinalizeOnDisconnect 断开终评

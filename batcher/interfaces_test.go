@@ -33,6 +33,7 @@ type fakeQualityStore struct {
 	mu         sync.Mutex
 	increments []*models.StatsIncrementEntry
 	heartbeats []*models.HeartbeatUpdateEntry
+	errUpdates []*models.ErrorUpdateEntry
 }
 
 func (f *fakeQualityStore) BatchIncrementStats(_ context.Context, entries []*models.StatsIncrementEntry) error {
@@ -49,6 +50,13 @@ func (f *fakeQualityStore) BatchUpdateHeartbeats(_ context.Context, entries []*m
 	return nil
 }
 
+func (f *fakeQualityStore) BatchAddErrors(_ context.Context, entries []*models.ErrorUpdateEntry) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.errUpdates = append(f.errUpdates, entries...)
+	return nil
+}
+
 func (f *fakeQualityStore) incrementsSnapshot() []*models.StatsIncrementEntry {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -59,6 +67,12 @@ func (f *fakeQualityStore) heartbeatsSnapshot() []*models.HeartbeatUpdateEntry {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]*models.HeartbeatUpdateEntry(nil), f.heartbeats...)
+}
+
+func (f *fakeQualityStore) errUpdatesSnapshot() []*models.ErrorUpdateEntry {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*models.ErrorUpdateEntry(nil), f.errUpdates...)
 }
 
 // fakeConnStore 连接记录仓储替身

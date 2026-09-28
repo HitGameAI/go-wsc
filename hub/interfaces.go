@@ -181,6 +181,11 @@ func (h *Hub) GetHeartbeatBatcher() *batcher.HeartbeatStatsUpdater {
 	return h.batcherMgr.HeartbeatStats()
 }
 
+// GetErrorStatsBatcher 连接错误统计批量聚合器
+func (h *Hub) GetErrorStatsBatcher() *batcher.ErrorStatsBatcher {
+	return h.batcherMgr.ErrorStats()
+}
+
 // GetMessageStatusUpdater 消息状态批量更新器
 func (h *Hub) GetMessageStatusUpdater() *batcher.MessageStatusUpdater {
 	return h.batcherMgr.StatusUpdater()
@@ -273,8 +278,8 @@ func (h *Hub) TrackReceiverMessageStats(connectionID string, receiverType models
 }
 
 // TrackConnectionError 记录连接错误（异常断开排查）
-func (h *Hub) TrackConnectionError(ctx context.Context, connectionID string, userType models.UserType, err error) {
-	h.statsMgr.TrackConnectionError(ctx, connectionID, userType, err)
+func (h *Hub) TrackConnectionError(connectionID string, userType models.UserType, err error) {
+	h.statsMgr.TrackConnectionError(connectionID, userType, err)
 }
 
 // ============================================================================

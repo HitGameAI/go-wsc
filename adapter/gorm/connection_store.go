@@ -160,18 +160,14 @@ func (r *ConnectionStore) updateConnectionRecord(ctx context.Context, record *mo
 
 // MarkDisconnected 标记连接为已断开
 // 写 duration/disconnected_at/is_abnormal 等会话终态字段，供 qualityRepo.FinalizeOnDisconnect 读 duration 算终评
-func (r *ConnectionStore) MarkDisconnected(ctx context.Context, connectionID string, reason models.DisconnectReason, code int) error {
-	record, err := r.GetByConnectionID(ctx, connectionID)
-	if err != nil {
-		if err == gorm.ErrRecordNotFound {
-			// 连接记录不存在（可能已被清理），直接返回
-			return nil
-		}
-		return fmt.Errorf("查询连接记录失败: %w", err)
-	}
-
+// connectedAt 由调用方从内存 Client 带入，直接 UPDATE 不再前置 SELECT（断连风暴下每断一连接省 1 次 DB 往返）；
+// UPDATE 影响 0 行（记录已被清理）与原 SELECT 找不到记录语义一致，静默返回
+func (r *ConnectionStore) MarkDisconnected(ctx context.Context, connectionID string, connectedAt time.Time, reason models.DisconnectReason, code int) error {
 	now := time.Now()
-	duration := int64(now.Sub(record.ConnectedAt).Seconds())
+	duration := int64(0)
+	if !connectedAt.IsZero() {
+		duration = int64(now.Sub(connectedAt).Seconds())
+	}
 	isAbnormal := reason != models.DisconnectReasonClientRequest && reason != models.DisconnectReasonServerShutdown
 
 	updates := map[string]any{

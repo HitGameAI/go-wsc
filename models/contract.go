@@ -101,6 +101,15 @@ type StatsIncrementEntry struct {
 	BytesReceived    int64
 }
 
+// ErrorUpdateEntry 错误更新条目（由连接质量仓库批量消费）
+// 同一连接的多次错误在攒批 flush 时合并：ErrorCount 为合并次数，LastError/LastErrorAt 为最新一次
+type ErrorUpdateEntry struct {
+	ConnectionID string
+	ErrorCount   int64
+	LastError    string
+	LastErrorAt  time.Time
+}
+
 // ConnectionQueryOptions 连接查询选项
 type ConnectionQueryOptions struct {
 	UserID     string // 用户ID过滤

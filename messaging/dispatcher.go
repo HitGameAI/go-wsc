@@ -221,7 +221,7 @@ func (m *Manager) handleClientRead(client *models.Client) {
 				// 异常断开 - 记录详细信息用于排查
 				m.logWithClient(logger.WARN, "客户端异常断开", client, "close_code", closeCode, "code_desc", codeDesc, "error", errStr)
 				// 记录错误到连接记录
-				m.host.TrackConnectionError(client.Context, client.ID, client.UserType, err)
+				m.host.TrackConnectionError(client.ID, client.UserType, err)
 			}
 			return
 		}

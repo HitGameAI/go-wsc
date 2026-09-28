@@ -42,6 +42,7 @@ func (f *fakeRecordHost) GetConnectionRecordRepo() spi.ConnectionStore {
 // markDisconnectedCall 记录一次 MarkDisconnected 调用参数
 type markDisconnectedCall struct {
 	connectionID string
+	connectedAt  time.Time
 	reason       models.DisconnectReason
 	code         int
 }
@@ -62,10 +63,10 @@ func (f *fakeRecordStore) Upsert(_ context.Context, record *models.ConnectionRec
 	return nil
 }
 
-func (f *fakeRecordStore) MarkDisconnected(_ context.Context, connectionID string, reason models.DisconnectReason, code int) error {
+func (f *fakeRecordStore) MarkDisconnected(_ context.Context, connectionID string, connectedAt time.Time, reason models.DisconnectReason, code int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.disconnected = append(f.disconnected, markDisconnectedCall{connectionID, reason, code})
+	f.disconnected = append(f.disconnected, markDisconnectedCall{connectionID, connectedAt, reason, code})
 	return nil
 }
 
@@ -127,7 +128,8 @@ func TestRecordSaveUpsertsAsync(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond, "记录应被异步 Upsert")
 }
 
-// TestRecordMarkDisconnectedAsync 异步标记断开：单连接路径 reason=ClientRequest、code=0
+// TestRecordMarkDisconnectedAsync 异步标记断开：单连接路径 reason=ClientRequest、code=0，
+// connectedAt 从内存 Client 带入（省去仓储侧前置 SELECT）
 func TestRecordMarkDisconnectedAsync(t *testing.T) {
 	manager, _, store := newRecordManagerFixture(t)
 
@@ -139,6 +141,7 @@ func TestRecordMarkDisconnectedAsync(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond, "断开标记应被异步写入")
 	call := store.disconnectCalls()[0]
 	assert.Equal(t, client.ID, call.connectionID)
+	assert.Equal(t, client.ConnectedAt, call.connectedAt, "connectedAt 应从内存 Client 带入")
 	assert.Equal(t, models.DisconnectReasonClientRequest, call.reason)
 	assert.Zero(t, call.code)
 }

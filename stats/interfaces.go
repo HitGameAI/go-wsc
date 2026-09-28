@@ -58,4 +58,6 @@ type Host interface {
 	GetMessageStatsBatcher() *batcher.MessageStatsBatcher
 	// GetHeartbeatBatcher 心跳统计批量聚合器；未启用时返回 nil
 	GetHeartbeatBatcher() *batcher.HeartbeatStatsUpdater
+	// GetErrorStatsBatcher 连接错误统计批量聚合器；未启用时返回 nil
+	GetErrorStatsBatcher() *batcher.ErrorStatsBatcher
 }

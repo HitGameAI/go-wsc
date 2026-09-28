@@ -105,7 +105,7 @@ func (m *RecordManager) MarkDisconnected(ctx context.Context, client *models.Cli
 			)
 		}).
 		ExecWithContext(func(ctx context.Context) error {
-			return m.store().MarkDisconnected(ctx, client.ID, models.DisconnectReasonClientRequest, 0)
+			return m.store().MarkDisconnected(ctx, client.ID, client.ConnectedAt, models.DisconnectReasonClientRequest, 0)
 		})
 }
 
@@ -119,7 +119,7 @@ func (m *RecordManager) MarkDisconnectedBatch(clients []*models.Client) {
 	syncx.ParallelForEachSlice(clients, func(i int, client *models.Client) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := m.store().MarkDisconnected(ctx, client.ID, models.DisconnectReasonServerShutdown, 1001); err != nil {
+		if err := m.store().MarkDisconnected(ctx, client.ID, client.ConnectedAt, models.DisconnectReasonServerShutdown, 1001); err != nil {
 			m.logger.DebugContextKV(client.Context, "shutdown: 更新连接断开记录失败",
 				"client_id", client.ID,
 				"user_id", client.UserID,

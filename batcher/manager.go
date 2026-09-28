@@ -4,7 +4,7 @@
  * @LastEditors: kamalyes 501893067@qq.com
  * @LastEditTime: 2026-09-23 09:21:00
  * @FilePath: \go-wsc\batcher\manager.go
- * @Description: 批处理器域管理器 —— 五个攒批组件的统一构造与停机编排
+ * @Description: 批处理器域管理器 —— 六个攒批组件的统一构造与停机编排
  *
  * 编排层只持一个 Manager 引用，组件构造参数解析与停机编排放归本域：
  * - 记录 outbox 复用 MessageStatus 攒批参数（write-ahead INSERT 与状态
@@ -21,12 +21,13 @@ import (
 	wscconfig "github.com/kamalyes/go-config/pkg/wsc"
 )
 
-// Manager 批处理器域管理器：持有五个攒批组件并提供域内访问器
+// Manager 批处理器域管理器：持有六个攒批组件并提供域内访问器
 type Manager struct {
 	statusUpdater  *MessageStatusUpdater
 	recordOutbox   *MessageRecordOutbox
 	heartbeatStats *HeartbeatStatsUpdater
 	messageStats   *MessageStatsBatcher
+	errorStats     *ErrorStatsBatcher
 	observerNotify *ObserverNotificationBatcher
 }
 
@@ -37,12 +38,14 @@ func NewManager(host Host, observerNotify ObserverNotifier, cfg *wscconfig.Batch
 	msgStatus := cfg.GetMessageStatusParams()
 	hbStats := cfg.GetHeartbeatStatsParams()
 	msgStats := cfg.GetMessageStatsParams()
+	errStats := cfg.GetErrorStatsParams()
 	obsNotify := cfg.GetObserverNotifyParams()
 	return &Manager{
 		statusUpdater:  NewMessageStatusUpdater(host, msgStatus.QueueSize, msgStatus.BatchSize, msgStatus.FlushInterval),
 		recordOutbox:   NewMessageRecordOutbox(host, msgStatus.QueueSize, msgStatus.BatchSize, msgStatus.FlushInterval),
 		heartbeatStats: NewHeartbeatStatsUpdater(host, hbStats.QueueSize, hbStats.BatchSize, hbStats.FlushInterval),
 		messageStats:   NewMessageStatsBatcher(host, msgStats.QueueSize, msgStats.BatchSize, msgStats.FlushInterval),
+		errorStats:     NewErrorStatsBatcher(host, errStats.QueueSize, errStats.BatchSize, errStats.FlushInterval),
 		observerNotify: NewObserverNotificationBatcher(observerNotify, obsNotify.QueueSize, obsNotify.BatchSize, obsNotify.FlushInterval),
 	}
 }
@@ -59,14 +62,18 @@ func (m *Manager) HeartbeatStats() *HeartbeatStatsUpdater { return m.heartbeatSt
 // MessageStats 消息统计批量聚合器
 func (m *Manager) MessageStats() *MessageStatsBatcher { return m.messageStats }
 
+// ErrorStats 连接错误统计批量更新器
+func (m *Manager) ErrorStats() *ErrorStatsBatcher { return m.errorStats }
+
 // ObserverNotify 观察者通知批量处理器
 func (m *Manager) ObserverNotify() *ObserverNotificationBatcher { return m.observerNotify }
 
-// StopTracking 停止心跳统计 / 消息统计 / 观察者通知批处理器
+// StopTracking 停止心跳统计 / 消息统计 / 错误统计 / 观察者通知批处理器
 // 连接清理前调用，Stop 内部 flush 剩余数据并等待完成
 func (m *Manager) StopTracking() {
 	m.heartbeatStats.Stop()
 	m.messageStats.Stop()
+	m.errorStats.Stop()
 	m.observerNotify.Stop()
 }
 

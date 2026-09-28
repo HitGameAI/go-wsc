@@ -39,6 +39,7 @@ type fakeHost struct {
 	connRecRepo spi.ConnectionStore
 	msgBatcher  *batcher.MessageStatsBatcher
 	hbBatcher   *batcher.HeartbeatStatsUpdater
+	errBatcher  *batcher.ErrorStatsBatcher
 }
 
 func newFakeHost() *fakeHost {
@@ -74,3 +75,9 @@ func (f *fakeHost) GetConnectionRecordRepo() spi.ConnectionStore { return f.conn
 func (f *fakeHost) GetMessageStatsBatcher() *batcher.MessageStatsBatcher { return f.msgBatcher }
 
 func (f *fakeHost) GetHeartbeatBatcher() *batcher.HeartbeatStatsUpdater { return f.hbBatcher }
+
+func (f *fakeHost) GetErrorStatsBatcher() *batcher.ErrorStatsBatcher { return f.errBatcher }
+
+// GetMessageRecordRepo 消息记录仓储（batcher.StorageBatchWriter 能力面；
+// stats 测试不消费消息记录，返回 nil 仅供构造真实 ErrorStatsBatcher）
+func (f *fakeHost) GetMessageRecordRepo() spi.MessageSink { return nil }

@@ -32,8 +32,9 @@ type ConnectionQualityStore interface {
 	// BatchIncrementStats 批量递增消息/字节统计（单事务）
 	BatchIncrementStats(ctx context.Context, entries []*models.StatsIncrementEntry) error
 
-	// AddError 记录错误
-	AddError(ctx context.Context, connectionID string, err error) error
+	// BatchAddErrors 批量记录连接错误（单事务）
+	// 同一连接的多次错误由调用方在攒批 flush 时合并为一条 ErrorUpdateEntry（count 累加、保留最新错误）
+	BatchAddErrors(ctx context.Context, entries []*models.ErrorUpdateEntry) error
 
 	// FinalizeOnDisconnect 断开终评：读质量行 + connect 表 duration，算 FinalScore 写 quality_score
 	FinalizeOnDisconnect(ctx context.Context, connectionID string) error

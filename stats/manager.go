@@ -156,9 +156,10 @@ func (m *Manager) TrackReceiverMessageStats(connectionID string, receiverType mo
 }
 
 // TrackConnectionError 追踪连接错误
-func (m *Manager) TrackConnectionError(ctx context.Context, connectionID string, userType models.UserType, err error) {
-	repo := m.host.GetConnectionQualityRepository()
-	if repo == nil || connectionID == "" || err == nil {
+// 优化：使用批量聚合器，避免每次错误都启动 goroutine 直写数据库
+// 断连风暴 3000 连接 = 3000 次 Submit + 攒批后 1 次事务（与消息统计同模式）
+func (m *Manager) TrackConnectionError(connectionID string, userType models.UserType, err error) {
+	if m.host.GetConnectionQualityRepository() == nil || connectionID == "" || err == nil {
 		return
 	}
 
@@ -167,14 +168,14 @@ func (m *Manager) TrackConnectionError(ctx context.Context, connectionID string,
 		return
 	}
 
-	syncx.Go().
-		WithTimeout(5 * time.Second).
-		OnPanic(func(r any) {
-			m.host.GetLogger().ErrorContextKV(ctx, "记录连接错误崩溃", "panic", r, "stack", string(debug.Stack()), "connection_id", connectionID)
-		}).
-		ExecWithContext(func(ctx context.Context) error {
-			return repo.AddError(ctx, connectionID, err)
+	// 使用批量更新器，避免每次错误创建 goroutine
+	if b := m.host.GetErrorStatsBatcher(); b != nil {
+		b.Submit(&batcher.ErrorStatsItem{
+			ConnectionID: connectionID,
+			Error:        err,
+			ErrorAt:      time.Now(),
 		})
+	}
 }
 
 // TrackHeartbeatStats 追踪心跳和 Ping 统计

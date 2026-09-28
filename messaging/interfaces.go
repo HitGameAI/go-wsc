@@ -97,7 +97,7 @@ type Host interface {
 	// TrackReceiverMessageStats 投递接收方消息统计
 	TrackReceiverMessageStats(connectionID string, receiverType models.UserType, dataSize int)
 	// TrackConnectionError 记录连接错误（异常断开排查）
-	TrackConnectionError(ctx context.Context, connectionID string, userType models.UserType, err error)
+	TrackConnectionError(connectionID string, userType models.UserType, err error)
 	// GetObserverNotifier 观察者通知批量处理器（未注入时返回 nil，观察者通知降级 no-op）
 	GetObserverNotifier() *batcher.ObserverNotificationBatcher
 	// NotifyObserverClients 向观察者客户端批量投递通知（观察者投递统一实现：
