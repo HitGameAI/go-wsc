@@ -1,4 +1,4 @@
-/*
+﻿/*
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2026-09-23 19:18:00
  * @LastEditors: kamalyes 501893067@qq.com
@@ -40,7 +40,7 @@ func TestNodeQueryFlightConcurrentMerge(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			<-start
-			val, err := f.Do("app-1|ns-1|user-hot", func() ([]string, error) {
+			val, err := f.Do(nodeQueryKey{appID: "app-1", namespace: "ns-1", userID: "user-hot"}, func() ([]string, error) {
 				atomic.AddInt32(&execCount, 1)
 				time.Sleep(20 * time.Millisecond) // 模拟 Redis RTT，撑开合并窗口
 				return []string{"node-a", "node-b"}, nil
@@ -69,17 +69,22 @@ func TestNodeQueryFlightEnvelopeIsolation(t *testing.T) {
 	var f nodeQueryFlight
 	var execCount int32
 
-	// 同名 userID 跨 app/ns 并发查询：各信封独立回源，不共享结果
-	keys := []string{"app-1|ns-1|u-shared", "app-2|ns-1|u-shared", "app-1|ns-2|u-shared", "|ns-1|u-shared"}
+	// 同名 userID 跨 app/ns 并发查询：各信封独立回源，不共享结果（含空 appID 边界）
+	keys := []nodeQueryKey{
+		{appID: "app-1", namespace: "ns-1", userID: "u-shared"},
+		{appID: "app-2", namespace: "ns-1", userID: "u-shared"},
+		{appID: "app-1", namespace: "ns-2", userID: "u-shared"},
+		{appID: "", namespace: "ns-1", userID: "u-shared"},
+	}
 	var wg sync.WaitGroup
 	for _, key := range keys {
 		wg.Add(1)
-		go func(k string) {
+		go func(k nodeQueryKey) {
 			defer wg.Done()
 			_, _ = f.Do(k, func() ([]string, error) {
 				atomic.AddInt32(&execCount, 1)
 				time.Sleep(10 * time.Millisecond)
-				return []string{k}, nil
+				return []string{k.userID}, nil
 			})
 		}(key)
 	}
@@ -99,10 +104,10 @@ func TestNodeQueryFlightNoCaching(t *testing.T) {
 		atomic.AddInt32(&execCount, 1)
 		return []string{"node-a"}, nil
 	}
-	if _, err := f.Do("app-1|ns-1|u-seq", load); err != nil {
+	if _, err := f.Do(nodeQueryKey{appID: "app-1", namespace: "ns-1", userID: "u-seq"}, load); err != nil {
 		t.Fatalf("首次查询失败: %v", err)
 	}
-	if _, err := f.Do("app-1|ns-1|u-seq", load); err != nil {
+	if _, err := f.Do(nodeQueryKey{appID: "app-1", namespace: "ns-1", userID: "u-seq"}, load); err != nil {
 		t.Fatalf("第二次查询失败: %v", err)
 	}
 
@@ -121,13 +126,13 @@ func TestNodeQueryFlightPanicCleanup(t *testing.T) {
 				t.Fatal("回源 panic 应向当前调用方继续传播")
 			}
 		}()
-		_, _ = f.Do("app-1|ns-1|u-panic", func() ([]string, error) {
+		_, _ = f.Do(nodeQueryKey{appID: "app-1", namespace: "ns-1", userID: "u-panic"}, func() ([]string, error) {
 			panic("redis 连接池耗尽")
 		})
 	}()
 
 	// panic 后该 key 不应残留 inflight：后续查询正常回源
-	val, err := f.Do("app-1|ns-1|u-panic", func() ([]string, error) {
+	val, err := f.Do(nodeQueryKey{appID: "app-1", namespace: "ns-1", userID: "u-panic"}, func() ([]string, error) {
 		return []string{"node-a"}, nil
 	})
 	if err != nil || len(val) != 1 {
@@ -150,7 +155,7 @@ func TestNodeQueryFlightWaiterSeesError(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = f.Do("app-1|ns-1|u-err", func() ([]string, error) {
+		_, _ = f.Do(nodeQueryKey{appID: "app-1", namespace: "ns-1", userID: "u-err"}, func() ([]string, error) {
 			close(ownerStarted)
 			time.Sleep(15 * time.Millisecond)
 			return nil, slowErr
@@ -159,7 +164,7 @@ func TestNodeQueryFlightWaiterSeesError(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-ownerStarted
-		waiterVal, waiterErr = f.Do("app-1|ns-1|u-err", func() ([]string, error) {
+		waiterVal, waiterErr = f.Do(nodeQueryKey{appID: "app-1", namespace: "ns-1", userID: "u-err"}, func() ([]string, error) {
 			return []string{"never"}, nil // 不应被执行（并入首个查询的飞行）
 		})
 	}()

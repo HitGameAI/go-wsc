@@ -29,11 +29,20 @@ import (
 	"sync"
 )
 
+// nodeQueryKey 节点查询 in-flight 合并 key（appID+namespace+userID 三元组）
+// 结构体直接作 map key（可比较、零哈希冲突歧义），消除热路径的
+// appID+"|"+ns+"|"+userID 字符串拼接分配
+type nodeQueryKey struct {
+	appID     string
+	namespace string
+	userID    string
+}
+
 // nodeQueryFlight 用户节点查询 in-flight 合并器
 // 零值可用（map 惰性初始化，适配测试中 &Hub{} 直接构造）
 type nodeQueryFlight struct {
 	mu       sync.Mutex
-	inflight map[string]*nodeQueryCall
+	inflight map[nodeQueryKey]*nodeQueryCall
 }
 
 // nodeQueryCall 单次进行中的查询（所有等待者共享同一份结果）
@@ -48,10 +57,10 @@ type nodeQueryCall struct {
 //
 // fn 的 ctx 为首个发起者的 ctx——同 key 意味着 appID+namespace+userID 三元组一致，
 // 信封过滤语义对所有等待者等价
-func (f *nodeQueryFlight) Do(key string, fn func() ([]string, error)) ([]string, error) {
+func (f *nodeQueryFlight) Do(key nodeQueryKey, fn func() ([]string, error)) ([]string, error) {
 	f.mu.Lock()
 	if f.inflight == nil {
-		f.inflight = make(map[string]*nodeQueryCall)
+		f.inflight = make(map[nodeQueryKey]*nodeQueryCall)
 	}
 	if call, ok := f.inflight[key]; ok {
 		f.mu.Unlock()

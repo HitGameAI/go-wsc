@@ -20,8 +20,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/kamalyes/go-toolbox/pkg/json"
-
 	"github.com/kamalyes/go-wsc/cluster"
 	"github.com/kamalyes/go-wsc/models"
 	"github.com/kamalyes/go-wsc/routing"
@@ -64,7 +62,10 @@ func (m *Manager) NotifyObserversDirect(msg *models.HubMessage, namespace string
 	if registry == nil {
 		return
 	}
-	ctx := routing.NewRoute().WithAppID(msg.AppID).WithNamespace(namespace).WithGroupIDs(groupIDs).Inject(m.host.Context())
+	// trace 恢复：批处理 flush 是异步路径（原请求 ctx 已丢失），从消息信封恢复 trace_id，
+	// 保证观察者投递与跨节点广播日志跟消息原始链路同一 trace（此前的 host.Context() 是断点）
+	ctx := msg.ContextFrom(m.host.Context())
+	ctx = routing.NewRoute().WithAppID(msg.AppID).WithNamespace(namespace).WithGroupIDs(groupIDs).Inject(ctx)
 
 	// 快速检查：无观察者时仅跨节点广播 - O(1)
 	if registry.GetObserverUserCount() == 0 {
@@ -75,37 +76,12 @@ func (m *Manager) NotifyObserversDirect(msg *models.HubMessage, namespace string
 	// 三级索引查找：合并所有 groupIDs 的观察者并去重
 	observers := registry.GetObserversForMessage(namespace, groupIDs...)
 
-	// 预构建观察者专用消息（Clone + metadata），所有观察者共享同一份
-	observerMsg := msg.Clone()
-	observerMsg.WithMetadata("observer_mode", "true")
-	observerMsg.WithMetadata("original_sender", msg.Sender)
-	observerMsg.WithMetadata("original_receiver", msg.Receiver)
-
-	// 预序列化一次（所有观察者复用，消除逐个 Clone+Marshal 开销）
-	msgData, err := json.Marshal(observerMsg)
-	if err != nil {
-		m.host.GetLogger().ErrorContextKV(ctx, "序列化观察者消息失败",
-			"message_id", msg.MessageID,
-			"error", err,
-		)
-		return
-	}
-
-	delivered := 0
-	for _, observer := range observers {
-		if observer.TrySend(msgData) {
-			delivered++
-		} else {
-			m.host.GetLogger().WarnContextKV(ctx, "观察者缓冲区已满或已关闭，丢弃消息",
-				"observer_id", observer.UserID,
-				"client_id", observer.ID,
-				"message_id", observerMsg.MessageID,
-			)
-		}
-	}
+	// 统一观察者投递（与 PubSub/gRPC 接收端共用 Host 端口：Clone + observer
+	// metadata + 预序列化一次 + TrySend 直投，旁路投递不走状态回报）
+	delivered := m.host.NotifyObserverClients(ctx, observers, msg)
 
 	m.host.GetLogger().DebugContextKV(ctx, "已通知本地观察者",
-		"message_id", observerMsg.MessageID,
+		"message_id", msg.MessageID,
 		"total_devices", len(observers),
 		"delivered", delivered,
 	)

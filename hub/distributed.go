@@ -44,9 +44,10 @@ func (h *Hub) queryUserNodes(ctx context.Context, userID string) ([]string, erro
 	// 🔥 in-flight 合并：同一 (appID, namespace, userID) 的并发查询共享单次回源
 	// （热点用户被多发送方并发命中 / 消息路由与踢人分发同用户并发时 N 次 RTT → 1 次）。
 	// 合并器无 TTL、不缓存结果，语义与逐次直查完全一致（不引入本地路由缓存
-	// 负缓存的陈旧空列表风险）；信封三元组作 key，跨 app/ns 查询互不共享
+	// 负缓存的陈旧空列表风险）；信封三元组作 key（结构体 key 零字符串拼接分配），
+	// 跨 app/ns 查询互不共享
 	appID, ns := routing.AppIDFromContext(ctx), routing.NamespaceFromContext(ctx)
-	return h.nodeQueryFlight.Do(appID+"|"+ns+"|"+userID, func() ([]string, error) {
+	return h.nodeQueryFlight.Do(nodeQueryKey{appID: appID, namespace: ns, userID: userID}, func() ([]string, error) {
 		return h.onlineStatusRepo.GetUserNodes(ctx, userID)
 	})
 }
@@ -649,60 +650,80 @@ func (h *Hub) handleDistributedObserverNotify(ctx context.Context, distMsg *mode
 		"observer_count", len(observers),
 	)
 
-	// 预构建观察者专用消息（Clone + metadata），所有观察者共享同一份
-	observerMsg := distMsg.Message.Clone()
-	observerMsg.WithMetadata("observer_mode", "true")
-	observerMsg.WithMetadata("original_sender", distMsg.Message.Sender)
-	observerMsg.WithMetadata("original_receiver", distMsg.Message.Receiver)
-
-	// 预序列化一次（所有观察者复用同一份 msgData，消除逐个 Clone+Marshal）
-	msgData, err := json.Marshal(observerMsg)
-	if err != nil {
-		h.logger.ErrorContextKV(ctx, "跨节点观察者消息序列化失败",
-			"message_id", distMsg.Message.MessageID, "error", err)
-		return err
-	}
-	msgID := observerMsg.MessageID
-
-	// 通知本节点的所有观察者
-	// TrySend 内部已处理 nil SendChan/IsClosed/缓冲满（等价旧 sendToObserver 的防御逻辑）
-	var successCount atomic.Int32
-	syncx.NewParallelSliceExecutor[*models.Client, error](observers).
-		OnSuccess(func(idx int, client *models.Client, result error) {
-			successCount.Add(1)
-		}).
-		OnError(func(idx int, client *models.Client, err error) {
-			h.logger.WarnContextKV(ctx, "跨节点通知观察者失败",
-				"observer_id", client.UserID,
-				"client_id", client.ID,
-				"message_id", msgID,
-				"error", err,
-			)
-		}).
-		OnPanic(func(idx int, client *models.Client, panicVal any) {
-			h.logger.WarnContextKV(ctx, "跨节点通知观察者时发生 panic(通道可能已关闭)",
-				"observer_id", client.UserID,
-				"client_id", client.ID,
-				"message_id", msgID,
-				"panic", panicVal,
-				"stack", string(debug.Stack()),
-			)
-		}).
-		Execute(func(idx int, observer *models.Client) (error, error) {
-			if observer.TrySend(msgData) {
-				return nil, nil
-			}
-			return models.ErrQueueAndPendingFull, nil
-		})
+	// 统一观察者投递（与 gRPC NotifyObservers RPC 共用 notifyObserverClients）
+	successCount := h.notifyObserverClients(ctx, observers, distMsg.Message)
 
 	h.logger.DebugContextKV(ctx, "已处理跨节点观察者通知",
 		"message_id", distMsg.Message.MessageID,
 		"from_node", distMsg.NodeID,
 		"total_observers", len(observers),
-		"success_count", successCount.Load(),
+		"success_count", successCount,
 	)
 
 	return nil
+}
+
+// notifyObserverClients 向观察者客户端批量投递通知（观察者投递统一实现：
+// gRPC NotifyObservers RPC 与 PubSub handleDistributedObserverNotify 共用，
+// 消除两路径逐客户端 SendToClient / 逐次 Marshal 的分散实现）
+//
+// 投递语义（旁路投递，非主投递链路）：
+//   - Clone + observer_mode metadata：观察者收到的消息带旁路标记，不污染原 msg
+//   - 预序列化一次：所有观察者共享同一份字节，消除逐客户端 Marshal
+//   - TrySend 直投：不走状态回报与离线转存——消息状态归属真正接收者，
+//     观察者通知的成败不得改写 message_record（此前 gRPC 路径逐客户端
+//     SendToClient 会把观察者的投递成败误写到接收者的消息状态上）
+//   - SSE 观察者走 TrySendSSE（msg 对象直投，与主投递路径的 SSE 分支对齐）
+//
+// 返回成功投递的观察者数
+func (h *Hub) notifyObserverClients(ctx context.Context, observers []*models.Client, msg *models.HubMessage) int32 {
+	if len(observers) == 0 {
+		return 0
+	}
+
+	// 预构建观察者专用信封（Clone + 旁路标记 + 预序列化一次，所有观察者共享同一份）
+	observerMsg, msgData, err := msg.ObserverCopy()
+	if err != nil {
+		h.logger.ErrorContextKV(ctx, "观察者通知消息序列化失败",
+			"message_id", msg.MessageID, "error", err)
+		return 0
+	}
+
+	// 通知本节点的所有观察者
+	// TrySend 内部已处理 nil SendChan/IsClosed/缓冲满（等价旧 sendToObserver 的防御逻辑）
+	var successCount atomic.Int32
+	syncx.NewParallelSliceExecutor[*models.Client, error](observers).
+		OnError(func(idx int, client *models.Client, err error) {
+			h.logger.WarnContextKV(ctx, "通知观察者失败",
+				"observer_id", client.UserID,
+				"client_id", client.ID,
+				"message_id", msg.MessageID,
+				"error", err,
+			)
+		}).
+		OnPanic(func(idx int, client *models.Client, panicVal any) {
+			h.logger.WarnContextKV(ctx, "通知观察者时发生 panic(通道可能已关闭)",
+				"observer_id", client.UserID,
+				"client_id", client.ID,
+				"message_id", msg.MessageID,
+				"panic", panicVal,
+				"stack", string(debug.Stack()),
+			)
+		}).
+		Execute(func(idx int, observer *models.Client) (error, error) {
+			if observer.ConnectionType == models.ConnectionTypeSSE {
+				if observer.TrySendSSE(observerMsg) {
+					successCount.Add(1)
+				}
+				return nil, nil
+			}
+			if observer.TrySend(msgData) {
+				successCount.Add(1)
+				return nil, nil
+			}
+			return models.ErrQueueAndPendingFull, nil
+		})
+	return successCount.Load()
 }
 
 // SubscribeBroadcastChannel 订阅全局广播频道

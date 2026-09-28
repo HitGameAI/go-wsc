@@ -222,6 +222,12 @@ func (h *Hub) CheckAndRouteToNode(ctx context.Context, userID string, msg *model
 // GetAllClusterNodeIDs 获取集群全部节点 ID
 func (h *Hub) GetAllClusterNodeIDs() []string { return h.getAllClusterNodeIDs() }
 
+// NotifyObserverClients 向观察者客户端批量投递通知（观察者投递统一实现，
+// messaging 本地路径 / PubSub 接收端 / gRPC 接收端三处共用，见 distributed.go）
+func (h *Hub) NotifyObserverClients(ctx context.Context, observers []*models.Client, msg *models.HubMessage) int32 {
+	return h.notifyObserverClients(ctx, observers, msg)
+}
+
 // MarkRerouteAttempted 标记消息已尝试重路由（防循环投递）
 func (h *Hub) MarkRerouteAttempted(messageID string, targetNodes []string, p2p bool) {
 	h.markRerouteAttempted(messageID, targetNodes, p2p)

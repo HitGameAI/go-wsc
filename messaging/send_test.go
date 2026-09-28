@@ -231,7 +231,7 @@ func TestSendToAllClientsInMapEmpty(t *testing.T) {
 	m, _ := newTestManager()
 
 	assert.NotPanics(t, func() {
-		m.SendToAllClientsInMap(map[string]*models.Client{}, makeGroupMessage("sender"))
+		m.SendToAllClientsInMap(m.host.Context(), map[string]*models.Client{}, makeGroupMessage("sender"))
 	})
 }
 
@@ -244,7 +244,7 @@ func TestSendToAllClientsInMapMultiple(t *testing.T) {
 	c3 := makeTestClient("c3", "u3")
 	clientMap := map[string]*models.Client{c1.ID: c1, c2.ID: c2, c3.ID: c3}
 
-	m.SendToAllClientsInMap(clientMap, makeGroupMessage("sender"))
+	m.SendToAllClientsInMap(m.host.Context(), clientMap, makeGroupMessage("sender"))
 
 	for _, c := range []*models.Client{c1, c2, c3} {
 		select {
@@ -554,6 +554,48 @@ func TestSyncToSenderDevices(t *testing.T) {
 		default:
 		}
 	})
+}
+
+// TestSyncToSenderDevicesNoStatusPollution 多端同步旁路投递语义：发送者其他设备的
+// 投递成败不得污染接收者的消息状态（sendToClientCore reportStatus=false 契约）
+//   - 成功投递到其他设备：不写状态回报、不创建消息记录
+//   - 其他设备通道满投递失败：同样零状态写入（修复前失败会误写接收者的 message_record）
+func TestSyncToSenderDevicesNoStatusPollution(t *testing.T) {
+	m, host, repo, cleanup := newStatusRecordingManager()
+	defer cleanup()
+
+	devOk := makeTestClient("c-sync-ok", "u-multi")
+	devFull := makeTestClient("c-sync-full", "u-multi")
+	for i := 0; i < cap(devFull.SendChan); i++ {
+		devFull.SendChan <- []byte("filler") // 填满通道，TrySend 必然失败
+	}
+	host.GetShardedRegistry().AddClient(devOk)
+	host.GetShardedRegistry().AddClient(devFull)
+
+	msg := makeGroupMessage("u-multi")
+	msg.MessageID = "m-sync-pollute"
+	msg.Receiver = "u-recv" // 状态归属真正接收者，与发送者设备无关
+	msg.SenderClient = "c-sync-send"
+	msg.InjectRoute(host.Context())
+
+	m.syncToSenderDevices(host.Context(), msg, nil)
+
+	// 未满通道的其他设备收到同步副本
+	select {
+	case data := <-devOk.SendChan:
+		assert.NotEmpty(t, data)
+	default:
+		t.Fatal("发送者其他在线设备应收到同步副本")
+	}
+
+	// 跨过状态更新器 flush 窗口（20ms）与 outbox 窗口（5ms）后，仓储零写入
+	time.Sleep(120 * time.Millisecond)
+	repo.batchUpdateMu.Lock()
+	updates := len(repo.batchUpdateCalls)
+	created := len(repo.createdRecords)
+	repo.batchUpdateMu.Unlock()
+	assert.Equal(t, 0, updates, "多端同步不得写状态回报（消息状态归属真正接收者）")
+	assert.Equal(t, 0, created, "多端同步不得创建消息记录")
 }
 
 // ============================================================================

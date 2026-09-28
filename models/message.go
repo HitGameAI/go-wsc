@@ -716,6 +716,26 @@ func (m *HubMessage) CloneDeep() any {
 	return m.Clone()
 }
 
+// ObserverCopy 构建观察者投递专用信封（观察者投递统一入口共用）：
+// Clone 副本 + 旁路标记（observer_mode / 原始收发双方）+ 预序列化一次
+//
+// 投递语义（旁路投递，非主投递链路）：
+//   - Clone 保证不污染原消息（观察者收到的副本与原消息互不影响）
+//   - 旁路标记保证接收方能区分观察者副本与直投消息
+//   - 预序列化一次：所有 WS 观察者复用同一份字节，SSE 观察者复用同一份对象，
+//     消除逐观察者 Clone+Marshal
+func (m *HubMessage) ObserverCopy() (*HubMessage, []byte, error) {
+	observerMsg := m.Clone()
+	observerMsg.WithMetadata("observer_mode", "true")
+	observerMsg.WithMetadata("original_sender", observerMsg.Sender)
+	observerMsg.WithMetadata("original_receiver", observerMsg.Receiver)
+	data, err := json.Marshal(observerMsg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return observerMsg, data, nil
+}
+
 // GetMessageID 获取消息ID，空值返回默认消息ID
 func (m *HubMessage) GetMessageID() string {
 	defer m.lockRead()()

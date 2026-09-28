@@ -90,6 +90,10 @@ type Hub struct {
 	grpcBatchDispatcher *cluster.GRPCBatchDispatcher
 	// nodeQueryFlight 用户节点查询 in-flight 合并器（热点用户并发扇入共享单次回源）
 	nodeQueryFlight nodeQueryFlight
+	// grpcDispatchSem gRPC 并发投递信号量（dispatchViaGRPC 与 grpcBroadcastGroups 共用，
+	// 懒初始化见 grpcDispatchSemaphore——测试零值 Hub 直接构造时安全）
+	grpcDispatchSem chan struct{}
+	grpcSemOnce     sync.Once
 	// rerouteGuard user_not_found 重路由守卫：messageID → 已拒绝节点集合
 	rerouteGuard sync.Map
 

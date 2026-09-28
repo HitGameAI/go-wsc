@@ -156,7 +156,11 @@ func (s *GRPCServer) SendToUser(ctx context.Context, req *wscpb.SendToUserReques
 
 	// 零拷贝遍历：仅对路由匹配的设备投递，避免跨 app/namespace 串扰
 	// （路由信封来自 msg 自身，跨节点 gRPC 调用链已丢失原 ctx 路由信息）
-	s.hub.shardedRegistry.ForEachUserClientFiltered(userID, msg.AppID, msg.Namespace, msg.GroupIDs, func(_ string, client *models.Client) bool {
+	// 检查与投递同维度：msg.AppID 与上方 HasUserClient 检查（经 InjectRoute 回写
+	// ctx 的归一化路由）同步归一化——空信封极端场景下检查按 DefaultAppID 过滤，
+	// 投递却不归一化会退化为无过滤跨 app 串扰
+	deliverAppID := constants.NormalizeAppID(msg.AppID)
+	s.hub.shardedRegistry.ForEachUserClientFiltered(userID, deliverAppID, msg.Namespace, msg.GroupIDs, func(_ string, client *models.Client) bool {
 		s.hub.messagingMgr.SendToClientSerialized(ctx, client, msg, preSerialized)
 		return true
 	})
@@ -269,12 +273,10 @@ func (s *GRPCServer) NotifyObservers(ctx context.Context, req *wscpb.NotifyObser
 	groupIDs := routing.GroupIDsFromContext(ctx)
 	observers := s.hub.shardedRegistry.GetObserversForMessage(namespace, groupIDs...)
 
-	// 逐个投递
-	var notified int32
-	for _, client := range observers {
-		s.hub.messagingMgr.SendToClient(ctx, client, msg)
-		notified++
-	}
+	// 统一观察者投递（与 PubSub 路径共用 notifyObserverClients：Clone + observer
+	// metadata + 预序列化一次 + TrySend 直投，不走状态回报——观察者通知的成败
+	// 不得改写真正接收者的 message_record）
+	notified := s.hub.notifyObserverClients(ctx, observers, msg)
 
 	return &wscpb.NotifyObserversResponse{
 		Notified: notified,

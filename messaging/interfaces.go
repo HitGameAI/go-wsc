@@ -100,6 +100,10 @@ type Host interface {
 	TrackConnectionError(ctx context.Context, connectionID string, userType models.UserType, err error)
 	// GetObserverNotifier 观察者通知批量处理器（未注入时返回 nil，观察者通知降级 no-op）
 	GetObserverNotifier() *batcher.ObserverNotificationBatcher
+	// NotifyObserverClients 向观察者客户端批量投递通知（观察者投递统一实现：
+	// Clone + observer metadata + 预序列化一次 + TrySend 直投，旁路投递不走状态回报）
+	// 返回成功投递的观察者数
+	NotifyObserverClients(ctx context.Context, observers []*models.Client, msg *models.HubMessage) int32
 
 	// ========== 过载保护域 ==========
 

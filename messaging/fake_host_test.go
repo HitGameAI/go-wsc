@@ -134,6 +134,29 @@ func (f *fakeHost) CheckAndRouteToNode(_ context.Context, _ string, _ *models.Hu
 // GetObserverNotifier 未注入观察者通知批处理器（NotifyObservers 攒批入口据此 no-op）
 func (f *fakeHost) GetObserverNotifier() *batcher.ObserverNotificationBatcher { return nil }
 
+// NotifyObserverClients 测试替身：信封构建与真实实现共用 ObserverCopy
+// （Clone + 旁路标记 + 预序列化一次），仅投递循环为顺序简化版
+// （真实实现为并行 executor，契约差异不影响投递语义验证）
+func (f *fakeHost) NotifyObserverClients(_ context.Context, observers []*models.Client, msg *models.HubMessage) int32 {
+	observerMsg, data, err := msg.ObserverCopy()
+	if err != nil {
+		return 0
+	}
+	var n int32
+	for _, observer := range observers {
+		if observer.ConnectionType == models.ConnectionTypeSSE {
+			if observer.TrySendSSE(observerMsg) {
+				n++
+			}
+			continue
+		}
+		if observer.TrySend(data) {
+			n++
+		}
+	}
+	return n
+}
+
 // DeleteRerouteGuard makeAckTimeoutCallback 无条件终态清理，no-op
 func (f *fakeHost) DeleteRerouteGuard(_ string) {}
 

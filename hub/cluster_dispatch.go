@@ -25,12 +25,14 @@ package hub
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/kamalyes/go-logger"
 	"github.com/kamalyes/go-toolbox/pkg/mathx"
+	"github.com/kamalyes/go-toolbox/pkg/syncx"
 	"github.com/kamalyes/go-wsc/cluster"
 	"github.com/kamalyes/go-wsc/constants"
 	"github.com/kamalyes/go-wsc/models"
@@ -65,6 +67,19 @@ const (
 // deadNodeProbeRetryDelay 定向发布返回 0 且节点心跳正常时的重试等待
 // 覆盖订阅断连重连窗口（秒级），避免订阅抖动误判死节点导致消息批量误转离线
 const deadNodeProbeRetryDelay = 300 * time.Millisecond
+
+// grpcDispatchConcurrency gRPC 并行投递上限（打满 gRPC 连接池的总闸，
+// dispatchViaGRPC 与 grpcBroadcastGroups 共用同一把信号量）
+const grpcDispatchConcurrency = 8
+
+// grpcDispatchSemaphore 返回 gRPC 并发信号量（Hub 生命周期内复用一把，
+// 消除每次投递的 make(chan) 分配；sync.Once 懒初始化，测试零值 Hub 直接构造安全）
+func (h *Hub) grpcDispatchSemaphore() chan struct{} {
+	h.grpcSemOnce.Do(func() {
+		h.grpcDispatchSem = make(chan struct{}, grpcDispatchConcurrency)
+	})
+	return h.grpcDispatchSem
+}
 
 // ============================================================================
 // 统一路由入口
@@ -363,12 +378,12 @@ func (h *Hub) dispatchViaGRPC(ctx context.Context, msg *models.HubMessage, opts 
 	grpcCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	// 并行投递（并发上限 8，与 grpcBroadcastGroups 对齐）：
+	// 并行投递（并发上限 8，与 grpcBroadcastGroups 共用 Hub 级信号量）：
 	// 串行时单个死节点的 3s 超时会拖慢整批投递（N 节点最坏 3N 秒）；
 	// 结果按索引写入无锁竞争，汇总在 wg.Wait 后串行进行
 	outcomes := make([]grpcDispatchOutcome, len(targetNodes))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 8)
+	sem := h.grpcDispatchSemaphore()
 	for i, nodeID := range targetNodes {
 		addr, ok := h.nodeRegistry.GetNodeAddr(nodeID)
 		if !ok {
@@ -655,19 +670,13 @@ func (h *Hub) publishToTargetedNodes(ctx context.Context, dispatch *models.Distr
 		}
 		if cmd.Val() == 0 {
 			// 订阅失活 ≠ 节点死亡：订阅断连重连窗口（秒级）内 PUBLISH 同样返回 0。
-			// 交叉验证节点心跳：心跳正常 → 等待重连窗口后重试一次，仍无人订阅才判死，
-			// 避免订阅抖动导致消息被批量误转离线
+			// 交叉验证节点心跳：心跳正常 → 异步等待重连窗口后重试一次（不再同步 sleep——此前每个疑似死节点阻塞 300ms，直接拖慢 routeToCluster → sendToUser 全同步链路，N 个节点最坏 300ms×N），重试成功即送达；仍无人订阅才判死
 			// 适配说明：cluster.NodeRegistry 未暴露 IsNodeAlive，以节点在注册表缓存中
 			// 存在作为心跳新鲜代理（refreshNodes 按 TTL 清理心跳过期节点）
 			if h.nodeRegistry != nil {
 				if _, alive := h.nodeRegistry.GetNodeAddr(targets[i]); alive {
-					time.Sleep(deadNodeProbeRetryDelay)
-					if retry, rerr := client.Publish(ctx, channels[i], data).Result(); rerr == nil && retry > 0 {
-						h.logger.InfoContextKV(ctx, "📡 [死节点探测] 心跳正常+订阅恢复，重试投递成功",
-							"target_node", targets[i],
-							"message_id", messageID)
-						continue
-					}
+					h.probeDeadNodeAsync(ctx, client, channels[i], data, targets[i], messageID, dispatch)
+					continue
 				}
 			}
 			deadNodes = append(deadNodes, targets[i])
@@ -681,6 +690,50 @@ func (h *Hub) publishToTargetedNodes(ctx context.Context, dispatch *models.Distr
 		)
 	}
 	return deadNodes, lastErr
+}
+
+// probeDeadNodeAsync 异步探测疑似死节点（订阅断连重连窗口重投，不阻塞投递主路径）
+//
+// 探测结论：
+//   - 重连窗口后重试 PUBLISH 成功 → 订阅恢复，消息即送达，无后续处理
+//   - 仍无人订阅 → 判死节点：P2P 消息补秒级兜底（handleDeadNodesForP2P 重查在线索引，
+//     用户所有连接所在节点均失活才立即转离线；仍有健康节点则保留 ACK 超时兜底）
+//
+// 细节：
+//   - ctx 经 WithoutCancel 派生：投递调用方的请求 ctx 可能随 RPC 结束取消，
+//     保留 trace/路由值但去掉取消传播，后台重试不被外层取消打断
+//   - P2P 兜底传 msg 的 Clone 副本：原 msg 归属同步调用链，异步 goroutine
+//     持有副本避免与调用方后续读写竞态
+func (h *Hub) probeDeadNodeAsync(ctx context.Context, client redis.UniversalClient, channel string, data []byte, nodeID, messageID string, dispatch *models.DistributedMessage) {
+	probeCtx := context.WithoutCancel(ctx)
+	syncx.Go(probeCtx).
+		OnPanic(func(r any) {
+			h.logger.ErrorContextKV(probeCtx, "📡 [死节点探测] 异步探测 panic",
+				"target_node", nodeID,
+				"message_id", messageID,
+				"panic", r,
+				"stack", string(debug.Stack()),
+			)
+		}).
+		Exec(func() {
+			time.Sleep(deadNodeProbeRetryDelay)
+			if retry, rerr := client.Publish(probeCtx, channel, data).Result(); rerr == nil && retry > 0 {
+				h.logger.InfoContextKV(probeCtx, "📡 [死节点探测] 心跳正常+订阅恢复，异步重试投递成功",
+					"target_node", nodeID,
+					"message_id", messageID)
+				return
+			}
+			h.logger.WarnContextKV(probeCtx, "📡 [死节点探测] 重连窗口后仍无人订阅，判定死节点",
+				"target_node", nodeID,
+				"message_id", messageID,
+			)
+			// P2P 消息补秒级兜底（与 routeToCluster 对 deadNodes 的处理语义一致，
+			// 判定条件也一致：SendMessage + TargetID 非空）
+			if dispatch != nil && dispatch.Message != nil &&
+				dispatch.Type == models.OperationTypeSendMessage && dispatch.TargetID != "" {
+				h.handleDeadNodesForP2P(probeCtx, dispatch.Message.Clone(), dispatch.TargetID, []string{nodeID})
+			}
+		})
 }
 
 // handleDeadNodesForP2P P2P 消息的死节点秒级兜底（publishToTargetedNodes 检测到定向频道无人订阅时调用）
@@ -761,7 +814,8 @@ func (h *Hub) grpcBroadcastGroups(ctx context.Context, addr string, opts cluster
 	var (
 		success int64
 		wg      sync.WaitGroup
-		sem     = make(chan struct{}, 8) // 并发上限，避免打满 gRPC 连接
+		// 并发上限，避免打满 gRPC 连接（与 dispatchViaGRPC 共用 Hub 级信号量）
+		sem = h.grpcDispatchSemaphore()
 	)
 	for _, gid := range groupIDs {
 		wg.Add(1)

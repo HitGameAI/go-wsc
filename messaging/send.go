@@ -530,15 +530,19 @@ func (m *Manager) flushOfflineBroadcasts(ctx context.Context, collector *offline
 // 本方法改为对全部去重成员一次 Pipeline 预取，本地/远端成员统一零回源。
 //
 // 返回 nil 表示不适用（单机模式/目标过少/批量查询失败），扇出回退原有逐用户查询路径。
-// 不修改调用方 msg：信封注入在克隆副本上完成（与 sendToUserWithRetry 内部同序同参）
+// 不修改调用方 msg：路由构造直接读 msg 信封字段（零 Clone），原始消息保持私有
 func (m *Manager) prefetchFanoutNodes(ctx context.Context, msg *models.HubMessage, userIDs []string) map[string][]string {
 	// 目标过少批量预取无收益（1 个用户 Pipeline 与单次查询等价）；单机模式无跨节点索引
 	if len(userIDs) < 2 || (!m.host.HasPubsub() && !m.host.IsGRPCEnabled()) {
 		return nil
 	}
-	// 路由信封注入（不归一化，保留调用方 ctx 原值）：群组扇出路径信封 ns="" 为跨 ns 通配语义，
-	// BatchGetUserNodes 走 unscoped 桶 + appID 过滤定位节点；在克隆副本上执行，不污染调用方原始 msg
-	routeCtx := msg.Clone().InjectRoute(ctx)
+	// 路由信封构造（不归一化 ns，保留调用方 ctx 原值）：群组扇出路径信封 ns="" 为跨 ns 通配语义，
+	// BatchGetUserNodes 走 unscoped 桶 + appID 过滤定位节点
+	// 零 Clone：批量预取仅消费路由维度（appID+ns），直接从 msg 信封构造 routeCtx，
+	// 消除整消息深拷贝（与 sendToUserWithRetry 的 InjectRoute 同参同序：msg 优先、ctx 兜底）
+	appID := mathx.IfEmpty(msg.AppID, routing.AppIDFromContext(ctx))
+	ns := mathx.IfEmpty(msg.Namespace, routing.NamespaceFromContext(ctx))
+	routeCtx := routing.NewRoute().WithAppID(appID).WithNamespace(ns).Inject(ctx)
 
 	// 去重 userID（含本地在线成员：其节点解析用于 sendToUser 的多端跨节点路由，一并预取消除 N+1）
 	seen := make(map[string]struct{}, len(userIDs))
@@ -918,12 +922,15 @@ func (m *Manager) SendConditional(ctx context.Context, condition func(*models.Cl
 
 // SendToAllClientsInMap 发送消息到映射中的所有客户端
 // 预序列化一次消息，避免对每个客户端重复 json.Marshal
-func (m *Manager) SendToAllClientsInMap(clientMap map[string]*models.Client, msg *models.HubMessage) {
+// trace 恢复：ctx 无 trace 时从消息信封恢复（msg.ContextFrom），保证投递日志
+// 与消息原始链路同一 trace_id（此前的 host.Context() 是 trace 断点）
+func (m *Manager) SendToAllClientsInMap(ctx context.Context, clientMap map[string]*models.Client, msg *models.HubMessage) {
 	// 复制客户端列表,避免在遍历时map被修改导致竞争
 	clients := connection.CopyClientsFromMap(clientMap)
 	if len(clients) == 0 {
 		return
 	}
+	ctx = msg.ContextFrom(ctx)
 
 	// 预序列化一次（WebSocket 客户端共用；SSE 走 TrySendSSE(msg) 不用 []byte）
 	// 序列化失败时 preSerialized=nil，由 SendToClientSerialized 内部兜底
@@ -931,7 +938,7 @@ func (m *Manager) SendToAllClientsInMap(clientMap map[string]*models.Client, msg
 
 	// 遍历复制后的列表发送消息
 	for _, client := range clients {
-		m.SendToClientSerialized(m.host.Context(), client, msg, preSerialized)
+		m.SendToClientSerialized(ctx, client, msg, preSerialized)
 	}
 }
 
@@ -950,6 +957,16 @@ func (m *Manager) SendToClient(ctx context.Context, client *models.Client, msg *
 //   - Admit 拒绝（Delay/Offline，P2P 场景仅极端水位触发）→ 转离线补发 + 上层重试兜底
 //   - 实时路径零改动（TrySend 成功路径）
 func (m *Manager) SendToClientSerialized(ctx context.Context, client *models.Client, msg *models.HubMessage, preSerialized []byte) bool {
+	return m.sendToClientCore(ctx, client, msg, preSerialized, true)
+}
+
+// sendToClientCore 投递核心体（带状态回报开关）
+// reportStatus=false 跳过状态回报与离线转存——多端同步/观察者通知等"旁路投递"专用：
+// 消息状态归属真正接收者（msg.Receiver），发送者其他设备的投递成败不得污染接收者的
+// message_record（成功误标 Success=接收者尚未收到即"已送达"；失败误转离线=接收者
+// 明明在线却在上线后收到重复推送）；负载指标（Admitted/Realtime/OnDelivered）照常
+// 记录——旁路投递同样占用节点投递资源，漏斗口径不缺位
+func (m *Manager) sendToClientCore(ctx context.Context, client *models.Client, msg *models.HubMessage, preSerialized []byte, reportStatus bool) bool {
 	// 检查客户端是否已关闭
 	if client.IsClosed() {
 		return false
@@ -978,7 +995,9 @@ func (m *Manager) SendToClientSerialized(ctx context.Context, client *models.Cli
 		}
 		// 合并器容量满：语义丢弃（latest-wins 尽头的容量保护）
 		m.host.GetOverloadMetrics().RecordEphemeralDrop()
-		m.updateMessageStatusAsync(ctx, msgID, receiver, models.MessageSendStatusFailed, models.FailureReasonQueueFull, "coalescer full")
+		if reportStatus {
+			m.updateMessageStatusAsync(ctx, msgID, receiver, models.MessageSendStatusFailed, models.FailureReasonQueueFull, "coalescer full")
+		}
 		return false
 	}
 
@@ -987,9 +1006,11 @@ func (m *Manager) SendToClientSerialized(ctx context.Context, client *models.Cli
 		// 水位读取（GetAdmissionLevel 内含闸门 nil 防御，热替换窗口安全）
 		level := m.host.GetAdmissionLevel()
 		rejectErr := fmt.Errorf("admission rejected at %s", level)
-		m.updateMessageStatusAsync(ctx, msgID, receiver, models.MessageSendStatusFailed, models.FailureReasonQueueFull, rejectErr.Error())
-		// 转离线补发（P2P 离线上线推送 + SendToUserWithRetry/ACK 重试双保险）
-		m.StoreOfflineOnDeliveryFailure(msg, rejectErr)
+		if reportStatus {
+			m.updateMessageStatusAsync(ctx, msgID, receiver, models.MessageSendStatusFailed, models.FailureReasonQueueFull, rejectErr.Error())
+			// 转离线补发（P2P 离线上线推送 + SendToUserWithRetry/ACK 重试双保险）
+			m.StoreOfflineOnDeliveryFailure(msg, rejectErr)
+		}
 		return false
 	}
 
@@ -1006,15 +1027,19 @@ func (m *Manager) SendToClientSerialized(ctx context.Context, client *models.Cli
 				"node_id", m.host.GetNodeID(),
 			)
 			// SSE消息成功发送，更新为成功状态
-			m.updateMessageStatusAsync(ctx, msgID, receiver, models.MessageSendStatusSuccess, "", "")
+			if reportStatus {
+				m.updateMessageStatusAsync(ctx, msgID, receiver, models.MessageSendStatusSuccess, "", "")
+			}
 			return true
 		}
 		sseErr := fmt.Errorf("SSE channel full or closed")
 		m.host.GetLogger().WarnContextKV(ctx, "SSE客户端消息通道已满或已关闭", "client_id", client.ID, "user_id", client.UserID)
-		// SSE通道已满或已关闭，更新为失败状态
-		m.updateMessageStatusAsync(ctx, msgID, receiver, models.MessageSendStatusFailed, models.FailureReasonQueueFull, sseErr.Error())
-		// 在线投递失败 → 异步转存离线（P2P 场景，避免循环）
-		m.StoreOfflineOnDeliveryFailure(msg, sseErr)
+		if reportStatus {
+			// SSE通道已满或已关闭，更新为失败状态
+			m.updateMessageStatusAsync(ctx, msgID, receiver, models.MessageSendStatusFailed, models.FailureReasonQueueFull, sseErr.Error())
+			// 在线投递失败 → 异步转存离线（P2P 场景，避免循环）
+			m.StoreOfflineOnDeliveryFailure(msg, sseErr)
+		}
 		return false
 	}
 
@@ -1027,8 +1052,10 @@ func (m *Manager) SendToClientSerialized(ctx context.Context, client *models.Cli
 		data, err = json.Marshal(msg)
 		if err != nil {
 			m.host.GetLogger().ErrorContextKV(ctx, "消息序列化失败", "error", err)
-			// 更新为失败状态
-			m.updateMessageStatusAsync(ctx, msgID, receiver, models.MessageSendStatusFailed, models.FailureReasonUnknown, err.Error())
+			if reportStatus {
+				// 更新为失败状态
+				m.updateMessageStatusAsync(ctx, msgID, receiver, models.MessageSendStatusFailed, models.FailureReasonUnknown, err.Error())
+			}
 			// 序列化失败无法转存离线（msg 无法被存储），只标记 Failed
 			return false
 		}
@@ -1036,7 +1063,9 @@ func (m *Manager) SendToClientSerialized(ctx context.Context, client *models.Cli
 
 	if client.TrySend(data) {
 		// 消息成功发送到客户端通道，更新为成功状态
-		m.updateMessageStatusAsync(ctx, msgID, receiver, models.MessageSendStatusSuccess, "", "")
+		if reportStatus {
+			m.updateMessageStatusAsync(ctx, msgID, receiver, models.MessageSendStatusSuccess, "", "")
+		}
 		// 送达漏斗埋点：实时送达 + 在途量出队
 		m.host.GetOverloadMetrics().RecordRealtime(guarantee)
 		m.host.AdmissionOnDelivered()
@@ -1058,10 +1087,12 @@ func (m *Manager) SendToClientSerialized(ctx context.Context, client *models.Cli
 
 	queueErr := fmt.Errorf("client send channel full or closed")
 	m.host.GetLogger().WarnContextKV(ctx, "客户端发送通道已满或已关闭", "client_id", client.ID)
-	// 发送通道已满或已关闭，更新为失败状态
-	m.updateMessageStatusAsync(ctx, msgID, receiver, models.MessageSendStatusFailed, models.FailureReasonQueueFull, queueErr.Error())
-	// 在线投递失败 → 异步转存离线（P2P 场景，避免循环）
-	m.StoreOfflineOnDeliveryFailure(msg, queueErr)
+	if reportStatus {
+		// 发送通道已满或已关闭，更新为失败状态
+		m.updateMessageStatusAsync(ctx, msgID, receiver, models.MessageSendStatusFailed, models.FailureReasonQueueFull, queueErr.Error())
+		// 在线投递失败 → 异步转存离线（P2P 场景，避免循环）
+		m.StoreOfflineOnDeliveryFailure(msg, queueErr)
+	}
 	return false
 }
 
@@ -1115,8 +1146,11 @@ func (m *Manager) syncToSenderDevices(ctx context.Context, msg *models.HubMessag
 		"message_id", msg.MessageID,
 	)
 
-	// 发送给发送者的其他设备
+	// 发送给发送者的其他设备（旁路投递：不走状态回报与离线转存）
+	// 状态归属真正接收者（msg.Receiver）：其他设备的投递成败若写回状态，
+	// 会把接收者的 message_record 误标 Success（其尚未收到）或误转离线
+	// （其在线却在上线后收到重复推送），见 sendToClientCore 的 reportStatus 语义
 	for _, device := range otherDevices {
-		m.SendToClientSerialized(ctx, device, msg, data)
+		m.sendToClientCore(ctx, device, msg, data, false)
 	}
 }
