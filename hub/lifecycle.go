@@ -37,6 +37,9 @@ const (
 	// 主路径为 messaging 域的 per-message ACK 超时时间轮，此低频扫描仅恢复发送节点宕机
 	// 导致 in-memory timer 丢失、永久停留 sending 的记录（见 messaging/node_ack_timeout.go）
 	nodeAckFallbackScanInterval = 5 * time.Minute
+	// shutdownChunkSize 停机批量清理的分块大小（Redis 批量下线 / 质量终评 IN 批量的单批规模，
+	// 与连接记录断连分块同量级：单批 IN 列表与 CASE WHEN 参数量可控）
+	shutdownChunkSize = 500
 )
 
 // Run 启动Hub
@@ -677,37 +680,40 @@ func (h *Hub) batchCleanupOnShutdown(clients []*models.Client) {
 		cancel()
 	}
 
-	// 批量清理 Redis 在线状态
+	// 批量清理 Redis 在线状态（分块批量下线，替代逐客户端 SetClientOffline：
 	if h.onlineStatusRepo != nil {
-		syncx.ParallelForEachSlice(clients, func(i int, client *models.Client) {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			if err := h.onlineStatusRepo.SetClientOffline(ctx, client); err != nil {
-				h.logger.DebugContextKV(client.Context, "shutdown: 清理 Redis 在线状态失败",
-					"client_id", client.ID,
-					"user_id", client.UserID,
+		for start := 0; start < len(clients); start += shutdownChunkSize {
+			end := mathx.Min(start+shutdownChunkSize, len(clients))
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := h.onlineStatusRepo.BatchSetClientsOfflineWithInfo(ctx, clients[start:end]); err != nil {
+				h.logger.WarnKV("shutdown: 批量清理 Redis 在线状态失败",
 					"error", err,
+					"chunk_size", end-start,
 				)
 			}
-		})
+			cancel()
+		}
 	}
 
 	// 批量更新连接记录为断开（连接域：ServerShutdown + 1001 并行终态）
-	h.recordMgr.MarkDisconnectedBatch(clients)
+	// 返回的 entries 含与 SQL 同源的 duration，供终评直接复用
+	entries := h.recordMgr.MarkDisconnectedBatch(clients)
 
-	// 批量质量终评（读 connect.duration 算 FinalScore 写 quality_score）
+	// 批量质量终评（读质量行 + duration 算 FinalScore 写 quality_score）
+	// 分块批量：每连接 3 条 SQL（读质量行 + 读时长 + 写终评）压缩为每块 2 条，
+	// 旧逐连接路径 26w 连接 = 78w 条 SQL，是停机窗口 DB 过载主源
 	if h.connectionQualityStore != nil {
-		syncx.ParallelForEachSlice(clients, func(i int, client *models.Client) {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := h.connectionQualityStore.FinalizeOnDisconnect(ctx, client.ID); err != nil {
-				h.logger.DebugContextKV(client.Context, "shutdown: 质量终评失败",
-					"client_id", client.ID,
-					"user_id", client.UserID,
+		for start := 0; start < len(entries); start += shutdownChunkSize {
+			end := mathx.Min(start+shutdownChunkSize, len(entries))
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := h.connectionQualityStore.BatchFinalizeOnDisconnect(ctx, entries[start:end]); err != nil {
+				h.logger.WarnKV("shutdown: 批量质量终评失败",
 					"error", err,
+					"chunk_size", end-start,
 				)
 			}
-		})
+			cancel()
+		}
 	}
 
 	h.logger.InfoKV("shutdown: 批量清理完成", "client_count", len(clients))

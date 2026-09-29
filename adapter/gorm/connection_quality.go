@@ -421,35 +421,72 @@ func (r *ConnectionQualityStore) BatchAddErrors(ctx context.Context, entries []*
 	return r.db.WithContext(ctx).Exec(sb.String(), args...).Error
 }
 
-// FinalizeOnDisconnect 断开终评
-// 读质量行 + connect 表 duration，Go 算 FinalScore(duration) 写 quality_score
-// 避免跨方言 SQL CASE 兼容问题，读内存计算
-func (r *ConnectionQualityStore) FinalizeOnDisconnect(ctx context.Context, connectionID string) error {
-	var quality models.ConnectionQuality
-	if err := r.getDB(ctx).Where("connection_id = ?", connectionID).First(&quality).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
-			// 质量记录不存在（可能已被清理），直接返回
-			return nil
-		}
-		return fmt.Errorf("查询质量记录失败: %w", err)
+// BatchFinalizeOnDisconnect 批量断开终评（读质量行算 FinalScore 写 quality_score）
+// 旧停机路径逐连接调用（每连接 SELECT quality + SELECT duration + UPDATE score = 3 条 SQL），
+// 26w 连接 = 78w 条 SQL 在停机窗口直打 DB，是滚动更新期 DB 过载主源（下游批量 SQL 5s 超时的加害者）；批量化：1 条 IN 读质量行 + Go 内算分 + 1 条 CASE WHEN 单 SQL 写回
+// duration 由调用方从 MarkDisconnectedBatch 返回的 entries 直接带入（与 SQL 写入值同源同公式），免去把刚落库的 duration 再读回来的往返
+// 与旧单条路径同语义：质量记录不存在（已被清理）的连接自然跳过（Find 不返回）
+func (r *ConnectionQualityStore) BatchFinalizeOnDisconnect(ctx context.Context, entries []*models.DisconnectionEntry) error {
+	if len(entries) == 0 {
+		return nil
 	}
 
-	// 读 connect 表 duration（断开时由 MarkDisconnected 写入）
-	var duration int64
-	if err := r.db.WithContext(ctx).
-		Table(models.ConnectionRecord{}.TableName()).
-		Where("connection_id = ?", connectionID).
-		Select("duration").Scan(&duration).Error; err != nil {
-		if err != gorm.ErrRecordNotFound {
-			return fmt.Errorf("查询连接时长失败: %w", err)
+	// duration 与 BatchMarkDisconnected 的 SQL 写入公式同源（ConnectedAt 零值 → 0）
+	durationOf := func(e *models.DisconnectionEntry) int64 {
+		if e.ConnectedAt.IsZero() {
+			return 0
 		}
-		duration = 0
+		return int64(e.DisconnectedAt.Sub(e.ConnectedAt).Seconds())
+	}
+	entryByID := make(map[string]*models.DisconnectionEntry, len(entries))
+	connectionIDs := make([]string, len(entries))
+	for i, e := range entries {
+		entryByID[e.ConnectionID] = e
+		connectionIDs[i] = e.ConnectionID
 	}
 
-	finalScore := quality.FinalScore(duration)
-	return r.getDB(ctx).
-		Where("connection_id = ?", connectionID).
-		UpdateColumn("quality_score", finalScore).Error
+	// 读质量行（整行：FinalScore → LiveScore 依赖全部统计列）
+	var qualities []*models.ConnectionQuality
+	if err := r.getDB(ctx).Where("connection_id IN ?", connectionIDs).Find(&qualities).Error; err != nil {
+		return fmt.Errorf("批量查询质量记录失败: %w", err)
+	}
+	if len(qualities) == 0 {
+		return nil
+	}
+
+	table := r.tableName
+	if table == "" {
+		table = (&models.ConnectionQuality{}).TableName()
+	}
+
+	var sb strings.Builder
+	// 参数预估：CASE 2/条 + IN 1/条
+	args := make([]interface{}, 0, len(qualities)*3)
+	sb.WriteString("UPDATE ")
+	sb.WriteString(table)
+	sb.WriteString(" SET quality_score = CASE connection_id")
+	for _, q := range qualities {
+		e := entryByID[q.ConnectionID]
+		score := float64(0)
+		if e != nil {
+			score = q.FinalScore(durationOf(e))
+		}
+		sb.WriteString(" WHEN ? THEN ?")
+		args = append(args, q.ConnectionID, score)
+	}
+	sb.WriteString(" ELSE quality_score END WHERE connection_id IN (")
+	first := true
+	for _, q := range qualities {
+		if !first {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('?')
+		args = append(args, q.ConnectionID)
+		first = false
+	}
+	sb.WriteString(")")
+
+	return r.db.WithContext(ctx).Exec(sb.String(), args...).Error
 }
 
 // GetByConnectionID 根据连接ID获取质量记录

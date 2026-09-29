@@ -36,8 +36,12 @@ type ConnectionQualityStore interface {
 	// 同一连接的多次错误由调用方在攒批 flush 时合并为一条 ErrorUpdateEntry（count 累加、保留最新错误）
 	BatchAddErrors(ctx context.Context, entries []*models.ErrorUpdateEntry) error
 
-	// FinalizeOnDisconnect 断开终评：读质量行 + connect 表 duration，算 FinalScore 写 quality_score
-	FinalizeOnDisconnect(ctx context.Context, connectionID string) error
+	// BatchFinalizeOnDisconnect 批量断开终评（唯一入口，单条 FinalizeOnDisconnect 已废弃）
+	// 停机路径逐连接终评 = 每连接 3 条 SQL（SELECT quality + SELECT duration + UPDATE score），
+	// 26w 连接 = 78w 条 SQL 在停机窗口直打 DB，是滚动更新期 DB 过载的主源；
+	// 批量化后 3 SQL/连接 → 每块 1 条 IN 读 + 1 条 CASE WHEN 写（Go 内算分），
+	// duration 由调用方从 MarkDisconnectedBatch 返回的 entries 带入（与 SQL 写入值同源，无需读回）
+	BatchFinalizeOnDisconnect(ctx context.Context, entries []*models.DisconnectionEntry) error
 
 	// GetByConnectionID 根据连接ID获取质量记录
 	GetByConnectionID(ctx context.Context, connectionID string) (*models.ConnectionQuality, error)

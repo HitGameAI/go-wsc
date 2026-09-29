@@ -117,13 +117,14 @@ func (m *RecordManager) MarkDisconnected(client *models.Client) {
 	}
 }
 
-// MarkDisconnectedBatch 停机批量标记连接断开（仓储未注入时 no-op）
-// 与单连接路径的差异：reason 为 ServerShutdown + 关闭码 1001（客户端据此识别
-// 服务端主动离开并重连）；不走攒批队列而是分块同步直调 BatchMarkDisconnected——
-// 停机路径需在本方法返回后立即被 FinalizeOnDisconnect 读 duration 算终评，保序优先
-func (m *RecordManager) MarkDisconnectedBatch(clients []*models.Client) {
+// MarkDisconnectedBatch 停机批量标记连接断开（仓储未注入时返回 nil）
+// 与单连接路径的差异：reason 为 ServerShutdown + 关闭码 1001（客户端据此识别服务端主动离开并重连）；
+// 不走攒批队列而是分块同步直调 BatchMarkDisconnected——
+// 停机路径需在本方法返回后立即被批量终评读 duration 算分，保序优先
+// 返回构造的 entries 供终评直接复用 duration（与 SQL 写入值同源同公式），免去终评再把刚落库的 duration 读回来的往返
+func (m *RecordManager) MarkDisconnectedBatch(clients []*models.Client) []*models.DisconnectionEntry {
 	if m.store() == nil || len(clients) == 0 {
-		return
+		return nil
 	}
 	now := time.Now()
 	entries := make([]*models.DisconnectionEntry, len(clients))
@@ -148,4 +149,5 @@ func (m *RecordManager) MarkDisconnectedBatch(clients []*models.Client) {
 			)
 		}
 	}
+	return entries
 }
