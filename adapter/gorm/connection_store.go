@@ -99,6 +99,16 @@ func (r *ConnectionStore) getDB(ctx context.Context) *gorm.DB {
 	return db.Model(&models.ConnectionRecord{})
 }
 
+// newQuery 为批量循环中的每条 UPDATE 构建干净会话
+// GORM 复用同一实例时 Where 条件会累积到共享 Statement，必须逐条新建
+func (r *ConnectionStore) newQuery(tx *gorm.DB) *gorm.DB {
+	db := tx.Session(&gorm.Session{NewDB: true})
+	if r.tableName != "" {
+		return db.Table(r.tableName)
+	}
+	return db.Model(&models.ConnectionRecord{})
+}
+
 // ========== 核心操作 ==========
 
 // Upsert 创建或更新连接记录（首次连接创建，重连时更新）
@@ -114,48 +124,9 @@ func (r *ConnectionStore) Upsert(ctx context.Context, record *models.ConnectionR
 	record.AppID = constants.NormalizeAppID(record.AppID)
 	record.Namespace = constants.NormalizeNamespace(record.Namespace)
 
-	existing, err := r.GetByConnectionID(ctx, record.ConnectionID)
-	if err != nil && err != gorm.ErrRecordNotFound {
-		return fmt.Errorf("查询连接记录失败: %w", err)
-	}
-
-	if existing != nil {
-		return r.updateConnectionRecord(ctx, record)
-	}
-
-	// 创建新记录时，使用 Omit("") 确保所有字段都被插入（包括零值）
-	return r.getDB(ctx).
-		Omit("").
-		Create(record).Error
-}
-
-// updateConnectionRecord 更新现有连接记录（重连场景）
-// 拆表后只刷新 connect 身份+会话生命周期字段（含重置心跳时间戳），质量指标重置由 qualityRepo.Upsert 负责
-func (r *ConnectionStore) updateConnectionRecord(ctx context.Context, record *models.ConnectionRecord) error {
-	now := time.Now()
-	updates := map[string]any{
-		"node_id":           record.NodeID,
-		"node_ip":           record.NodeIP,
-		"node_port":         record.NodePort,
-		"client_ip":         record.ClientIP,
-		"client_type":       record.ClientType,
-		"protocol":          record.Protocol,
-		"connected_at":      now,
-		"disconnected_at":   nil,
-		"duration":          0,
-		"last_ping_at":      nil,
-		"last_pong_at":      nil,
-		"is_active":         true,
-		"is_abnormal":       false,
-		"is_forced_offline": false,
-		"metadata":          record.Metadata,
-		"disconnect_reason": "",
-		"disconnect_code":   0,
-	}
-
-	return r.getDB(ctx).
-		Where("connection_id = ?", record.ConnectionID).
-		Updates(updates).Error
+	// 复用 BatchUpsert 的 ON CONFLICT 单 SQL 路径
+	// 替代旧的「前置 SELECT 判存在 + Create/Update」两步（重连场景 2 次 DB 往返）
+	return r.BatchUpsert(ctx, []*models.ConnectionRecord{record})
 }
 
 // MarkDisconnected 标记连接为已断开
@@ -193,13 +164,6 @@ func (r *ConnectionStore) BatchUpdateHeartbeats(ctx context.Context, entries []*
 	}
 
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		query := tx
-		if r.tableName != "" {
-			query = tx.Table(r.tableName)
-		} else {
-			query = tx.Model(&models.ConnectionRecord{})
-		}
-
 		for _, entry := range entries {
 			updates := make(map[string]any)
 			if entry.PingTime != nil {
@@ -211,7 +175,8 @@ func (r *ConnectionStore) BatchUpdateHeartbeats(ctx context.Context, entries []*
 			if len(updates) == 0 {
 				continue
 			}
-			if err := query.Where("connection_id = ?", entry.ConnectionID).Updates(updates).Error; err != nil {
+			// 逐条新建干净会话：GORM 复用同一实例时 Where 条件会累积到共享 Statement
+			if err := r.newQuery(tx).Where("connection_id = ?", entry.ConnectionID).Updates(updates).Error; err != nil {
 				continue // 单条失败不影响其他条目
 			}
 		}
@@ -437,7 +402,9 @@ func (r *ConnectionStore) BatchUpsert(ctx context.Context, records []*models.Con
 		return nil
 	}
 
-	// 冲突时更新重连相关字段（与 updateConnectionRecord 逻辑一致）
+	// 冲突时更新重连相关字段（与重连语义一致），metadata 不在冲突分支——
+	// 它只随首次 INSERT 写入（同一 connection_id 的重复注册来自同一次握手，metadata 不变），
+	// 跳过可避免每次重连全量重写 1-2KB JSON 的写放大
 	// 通过 Dialect 引擎兼容 MySQL 的 VALUES(col) 与 SQLite/PostgreSQL 的 excluded.col
 	dialect := sqlbuilder.DetectDialect(r.db)
 	onConflict := clause.OnConflict{
@@ -457,7 +424,6 @@ func (r *ConnectionStore) BatchUpsert(ctx context.Context, records []*models.Con
 			"is_active":         true,
 			"is_abnormal":       false,
 			"is_forced_offline": false,
-			"metadata":          gorm.Expr(dialect.UpsertColumnRef("metadata")),
 			"disconnect_reason": "",
 			"disconnect_code":   0,
 		}),
