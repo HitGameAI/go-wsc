@@ -98,20 +98,14 @@ func (s *SlowConsumerScanner) ScanOnce() {
 	threshold := float64(constants.SlowConsumerThresholdRatio)
 	consecutiveLimit := constants.SlowConsumerConsecutiveThreshold
 
-	// 本轮活跃的 clientID 集合（惰性清理的依据：不在本轮集合中的旧状态直接删除）
-	var active sync.Map
-
 	s.registry.ForEachClientParallel(0, func(_ string, client *models.Client) {
-		key := client.ID
-		active.Store(key, struct{}{})
-
 		ratio := client.BacklogRatio()
 		if ratio < threshold {
-			s.states.Delete(key) // 恢复正常：清零（迟滞清除，防止历史计数误伤）
+			s.states.Delete(client.ID) // 恢复正常：清零（迟滞清除，防止历史计数误伤）
 			return
 		}
 
-		state, _ := s.states.LoadOrStore(key, &slowConsumerState{})
+		state, _ := s.states.LoadOrStore(client.ID, &slowConsumerState{})
 		sc := state.(*slowConsumerState)
 		sc.consecutive++
 
@@ -119,7 +113,7 @@ func (s *SlowConsumerScanner) ScanOnce() {
 		case sc.consecutive >= consecutiveLimit:
 			// 🚨 三级：驱逐（先保全消息再断链——治理不丢消息）
 			s.evict(client, sc, ratio)
-			s.states.Delete(key)
+			s.states.Delete(client.ID)
 		case sc.consecutive >= consecutiveLimit-1 && !sc.warned:
 			// ⚠️ 二级：告警（KV 日志一次；下一轮仍超阈值将驱逐）
 			sc.warned = true
@@ -141,8 +135,16 @@ func (s *SlowConsumerScanner) ScanOnce() {
 	})
 
 	// 惰性清理：已断连/已驱逐的旧状态（防状态表缓慢膨胀）
+	// 反向遍历 states 而非正向构建全量活跃集合——正常态 states 近空表，
+	// Range 立即返回零分配；若按活跃集合实现，万级连接 × 每秒一轮的
+	// sync.Map Store 是持续 GC 大户（压测实测贡献约 1/3 的 CPU 于 GC 路径）
 	s.states.Range(func(key, _ any) bool {
-		if _, ok := active.Load(key); !ok {
+		id, ok := key.(string)
+		if !ok {
+			s.states.Delete(key)
+			return true
+		}
+		if _, exists := s.registry.GetClient(id); !exists {
 			s.states.Delete(key)
 		}
 		return true
