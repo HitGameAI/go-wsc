@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	wscconfig "github.com/kamalyes/go-config/pkg/wsc"
@@ -156,32 +157,95 @@ func (r *ConnectionStore) MarkDisconnected(ctx context.Context, connectionID str
 }
 
 // BatchUpdateHeartbeats 批量更新心跳时间戳（connect 表 last_ping_at/last_pong_at）
-// 使用单事务包裹所有更新，将 N 次 BeginTx/Commit 压缩为 1 次
-// 单条失败不影响其他条目（continue 跳过），Ping 统计由 ConnectionQualityStore 写 quality 表
+// CASE WHEN 单 SQL 合并：批内 N 条逐条 UPDATE 压缩为 1 条
+// （SET col = CASE connection_id WHEN ? THEN ? ... ELSE col END WHERE connection_id IN (...)），
+// 消除逐条 Updates 的 map 解析/SQL 生成/协议往返（1w 连接 × 30s 心跳 = 333 entry/s 稳态下，
+// CPU profile 实测本路径占全进程 22%）；单 SQL 自身原子，无需事务包裹；
+// ELSE 保列值使无该字段的条目行保持原样；CASE WHEN 为 SQL 标准，MySQL/PG/CockroachDB 通吃
 func (r *ConnectionStore) BatchUpdateHeartbeats(ctx context.Context, entries []*models.HeartbeatUpdateEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
 
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		for _, entry := range entries {
-			updates := make(map[string]any)
-			if entry.PingTime != nil {
-				updates["last_ping_at"] = entry.PingTime
-			}
-			if entry.PongTime != nil {
-				updates["last_pong_at"] = entry.PongTime
-			}
-			if len(updates) == 0 {
-				continue
-			}
-			// 逐条新建干净会话：GORM 复用同一实例时 Where 条件会累积到共享 Statement
-			if err := r.newQuery(tx).Where("connection_id = ?", entry.ConnectionID).Updates(updates).Error; err != nil {
-				continue // 单条失败不影响其他条目
+	// 批内同连接多条 entry 按字段级合并（PingTime/PongTime 各取最后非 nil），
+	// 等价于逐条 UPDATE 的最终状态——entry 级覆盖会在"一条 ping + 一条 pong"互补时丢字段
+	type connectPatch struct{ ping, pong *time.Time }
+	patches := make(map[string]*connectPatch, len(entries))
+	for _, e := range entries {
+		p := patches[e.ConnectionID]
+		if p == nil {
+			p = &connectPatch{}
+			patches[e.ConnectionID] = p
+		}
+		if e.PingTime != nil {
+			p.ping = e.PingTime
+		}
+		if e.PongTime != nil {
+			p.pong = e.PongTime
+		}
+	}
+
+	var pingCount, pongCount int
+	for _, p := range patches {
+		if p.ping != nil {
+			pingCount++
+		}
+		if p.pong != nil {
+			pongCount++
+		}
+	}
+	if pingCount == 0 && pongCount == 0 {
+		return nil
+	}
+
+	table := r.tableName
+	if table == "" {
+		table = (&models.ConnectionRecord{}).TableName()
+	}
+
+	var sb strings.Builder
+	args := make([]interface{}, 0, (pingCount+pongCount)*2+len(patches))
+	sb.WriteString("UPDATE ")
+	sb.WriteString(table)
+	sb.WriteString(" SET ")
+
+	if pingCount > 0 {
+		sb.WriteString("last_ping_at = CASE connection_id")
+		for cid, p := range patches {
+			if p.ping != nil {
+				sb.WriteString(" WHEN ? THEN ?")
+				args = append(args, cid, *p.ping)
 			}
 		}
-		return nil // 始终提交事务（单条失败已跳过）
-	})
+		sb.WriteString(" ELSE last_ping_at END")
+	}
+	if pongCount > 0 {
+		if pingCount > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("last_pong_at = CASE connection_id")
+		for cid, p := range patches {
+			if p.pong != nil {
+				sb.WriteString(" WHEN ? THEN ?")
+				args = append(args, cid, *p.pong)
+			}
+		}
+		sb.WriteString(" ELSE last_pong_at END")
+	}
+
+	sb.WriteString(" WHERE connection_id IN (")
+	first := true
+	for cid := range patches {
+		if !first {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('?')
+		args = append(args, cid)
+		first = false
+	}
+	sb.WriteString(")")
+
+	return r.db.WithContext(ctx).Exec(sb.String(), args...).Error
 }
 
 // GetByConnectionID 根据连接ID获取连接记录
