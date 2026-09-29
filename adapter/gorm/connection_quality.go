@@ -69,6 +69,17 @@ func (r *ConnectionQualityStore) getDB(ctx context.Context) *gorm.DB {
 	return db.Model(&models.ConnectionQuality{})
 }
 
+// newQuery 为批量循环中的每条 UPDATE 构建干净会话
+// GORM 复用同一实例时 Where 条件会累积到共享 Statement（曾导致线上
+// WHERE connection_id='A' AND connection_id='B' 永不命中、统计静默丢失），必须逐条新建
+func (r *ConnectionQualityStore) newQuery(tx *gorm.DB) *gorm.DB {
+	db := tx.Session(&gorm.Session{NewDB: true})
+	if r.tableName != "" {
+		return db.Table(r.tableName)
+	}
+	return db.Model(&models.ConnectionQuality{})
+}
+
 // ========== 核心操作 ==========
 
 // Upsert 创建或更新质量记录
@@ -127,13 +138,6 @@ func (r *ConnectionQualityStore) BatchUpdateHeartbeats(ctx context.Context, entr
 	}
 
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		query := tx
-		if r.tableName != "" {
-			query = tx.Table(r.tableName)
-		} else {
-			query = tx.Model(&models.ConnectionQuality{})
-		}
-
 		for _, entry := range entries {
 			// 刷新活跃时间（供清理任务判断，心跳时间戳本身落 connect 表）
 			updates := make(map[string]any)
@@ -141,7 +145,7 @@ func (r *ConnectionQualityStore) BatchUpdateHeartbeats(ctx context.Context, entr
 				updates["last_active_at"] = entry.PingTime
 			}
 			if len(updates) > 0 {
-				if err := query.Where("connection_id = ?", entry.ConnectionID).Updates(updates).Error; err != nil {
+				if err := r.newQuery(tx).Where("connection_id = ?", entry.ConnectionID).Updates(updates).Error; err != nil {
 					continue
 				}
 			}
@@ -153,7 +157,9 @@ func (r *ConnectionQualityStore) BatchUpdateHeartbeats(ctx context.Context, entr
 					"max_ping_ms":     gorm.Expr("CASE WHEN max_ping_ms = 0 OR max_ping_ms < ? THEN ? ELSE max_ping_ms END", entry.PingMs, entry.PingMs),
 					"min_ping_ms":     gorm.Expr("CASE WHEN min_ping_ms = 0 OR min_ping_ms > ? THEN ? ELSE min_ping_ms END", entry.PingMs, entry.PingMs),
 				}
-				query.Where("connection_id = ?", entry.ConnectionID).Updates(pingUpdates)
+				if err := r.newQuery(tx).Where("connection_id = ?", entry.ConnectionID).Updates(pingUpdates).Error; err != nil {
+					continue
+				}
 			}
 		}
 		return nil
@@ -167,13 +173,6 @@ func (r *ConnectionQualityStore) BatchIncrementStats(ctx context.Context, entrie
 	}
 
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		query := tx
-		if r.tableName != "" {
-			query = tx.Table(r.tableName)
-		} else {
-			query = tx.Model(&models.ConnectionQuality{})
-		}
-
 		for _, entry := range entries {
 			updates := make(map[string]any)
 			if entry.MessagesSent > 0 {
@@ -189,7 +188,7 @@ func (r *ConnectionQualityStore) BatchIncrementStats(ctx context.Context, entrie
 				updates["bytes_received"] = gorm.Expr("bytes_received + ?", entry.BytesReceived)
 			}
 			if len(updates) > 0 {
-				if err := query.Where("connection_id = ?", entry.ConnectionID).Updates(updates).Error; err != nil {
+				if err := r.newQuery(tx).Where("connection_id = ?", entry.ConnectionID).Updates(updates).Error; err != nil {
 					continue
 				}
 			}
@@ -207,20 +206,13 @@ func (r *ConnectionQualityStore) BatchAddErrors(ctx context.Context, entries []*
 	}
 
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		query := tx
-		if r.tableName != "" {
-			query = tx.Table(r.tableName)
-		} else {
-			query = tx.Model(&models.ConnectionQuality{})
-		}
-
 		for _, entry := range entries {
 			updates := map[string]any{
 				"error_count":   gorm.Expr("error_count + ?", entry.ErrorCount),
 				"last_error":    entry.LastError,
 				"last_error_at": entry.LastErrorAt,
 			}
-			if err := query.Where("connection_id = ?", entry.ConnectionID).Updates(updates).Error; err != nil {
+			if err := r.newQuery(tx).Where("connection_id = ?", entry.ConnectionID).Updates(updates).Error; err != nil {
 				continue
 			}
 		}

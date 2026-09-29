@@ -130,8 +130,9 @@ func (r *OfflineStore) QueryMessages(ctx context.Context, filter *spi.OfflineMes
 
 	// 命名空间过滤：空表示查询所有命名空间（历史行为）；非空时同时命中通配群组消息——
 	// 群组离线消息 namespace=''（群组投递信封 ns 跨 ns 通配），用户在任何租户上线都应收到
+	// 用 IN 而非 OR：等价语义下 IN 可走 (app_id, receiver, namespace) 复合索引，OR 会破坏索引选择
 	if filter.Namespace != "" {
-		gormDB = gormDB.Where("namespace = ? OR namespace = ''", filter.Namespace)
+		gormDB = gormDB.Where("namespace IN (?, '')", filter.Namespace)
 	}
 
 	// 分页游标：从 cursor 之后的消息开始读取（使用原生 GORM，因为需要子查询）
@@ -164,8 +165,8 @@ func (r *OfflineStore) GetCountByReceiver(ctx context.Context, appID, namespace,
 	var count int64
 	err := r.db.WithContext(ctx).
 		Model(&models.OfflineMessageRecord{}).
-		// namespace='' 为通配群组消息（跨 ns 投递语义），本租户计数需同时命中
-		Where("app_id = ? AND (namespace = ? OR namespace = '') AND receiver = ? AND expire_at > ?", appID, namespace, receiverID, time.Now()).
+		// namespace='' 为通配群组消息（跨 ns 投递语义），本租户计数需同时命中；IN 写法可走复合索引
+		Where("app_id = ? AND namespace IN (?, '') AND receiver = ? AND expire_at > ?", appID, namespace, receiverID, time.Now()).
 		Where("status IN ?", models.PendingOfflineStatuses).
 		Count(&count).Error
 	return count, err
@@ -176,8 +177,8 @@ func (r *OfflineStore) GetCountBySender(ctx context.Context, appID, namespace, s
 	var count int64
 	err := r.db.WithContext(ctx).
 		Model(&models.OfflineMessageRecord{}).
-		// namespace='' 为通配群组消息（跨 ns 投递语义），本租户计数需同时命中
-		Where("app_id = ? AND (namespace = ? OR namespace = '') AND sender = ? AND expire_at > ?", appID, namespace, senderID, time.Now()).
+		// namespace='' 为通配群组消息（跨 ns 投递语义），本租户计数需同时命中；IN 写法可走复合索引
+		Where("app_id = ? AND namespace IN (?, '') AND sender = ? AND expire_at > ?", appID, namespace, senderID, time.Now()).
 		Where("status IN ?", models.PendingOfflineStatuses).
 		Count(&count).Error
 	return count, err
@@ -186,8 +187,8 @@ func (r *OfflineStore) GetCountBySender(ctx context.Context, appID, namespace, s
 // ClearByReceiver 清空用户作为接收者的所有离线消息（按应用+命名空间隔离，含通配群组消息）
 func (r *OfflineStore) ClearByReceiver(ctx context.Context, appID, namespace, receiverID string) error {
 	return r.db.WithContext(ctx).
-		// namespace='' 为通配群组消息（跨 ns 投递语义），本租户清理需同时命中
-		Where("app_id = ? AND (namespace = ? OR namespace = '') AND receiver = ?", appID, namespace, receiverID).
+		// namespace='' 为通配群组消息（跨 ns 投递语义），本租户清理需同时命中；IN 写法可走复合索引
+		Where("app_id = ? AND namespace IN (?, '') AND receiver = ?", appID, namespace, receiverID).
 		Delete(&models.OfflineMessageRecord{}).Error
 }
 
