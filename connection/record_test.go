@@ -13,6 +13,8 @@ package connection
 
 import (
 	"context"
+	"errors"
+	"sort"
 	"strconv"
 	"sync"
 	"testing"
@@ -75,6 +77,8 @@ type fakeRecordStore struct {
 	upserts []*models.ConnectionRecord
 	// chunks 每次 BatchMarkDisconnected 调用记为一个块（停机路径分块直调）
 	chunks [][]*models.DisconnectionEntry
+	// markErr 注入批量断连错误（验证块失败不阻断其余块，错误仅记日志）
+	markErr error
 }
 
 func (f *fakeRecordStore) Upsert(_ context.Context, record *models.ConnectionRecord) error {
@@ -88,7 +92,7 @@ func (f *fakeRecordStore) BatchMarkDisconnected(_ context.Context, entries []*mo
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.chunks = append(f.chunks, append([]*models.DisconnectionEntry(nil), entries...))
-	return nil
+	return f.markErr
 }
 
 func (f *fakeRecordStore) upsertCount() int {
@@ -233,9 +237,14 @@ func TestRecordMarkDisconnectedBatchChunks(t *testing.T) {
 
 	chunks := store.disconnectChunks()
 	require.Len(t, chunks, 3, "超上限应按块拆分")
-	assert.Len(t, chunks[0], disconnectionShutdownChunkSize)
-	assert.Len(t, chunks[1], disconnectionShutdownChunkSize)
-	assert.Len(t, chunks[2], 37)
+	// 块间并行提交，各块到达顺序不确定，按块大小排序后校验边界
+	sizes := make([]int, len(chunks))
+	for i, chunk := range chunks {
+		sizes[i] = len(chunk)
+	}
+	sort.Ints(sizes)
+	assert.Equal(t, []int{37, disconnectionShutdownChunkSize, disconnectionShutdownChunkSize}, sizes,
+		"应为 2 个满块 + 37 条余数块")
 
 	seen := make(map[string]bool, total)
 	for _, chunk := range chunks {
@@ -246,6 +255,43 @@ func TestRecordMarkDisconnectedBatchChunks(t *testing.T) {
 		}
 	}
 	assert.Len(t, seen, total, "全部连接应被标记且去重")
+}
+
+// TestRecordMarkDisconnectedBatchStoreError 块失败不阻断：仓储持续返回错误时
+// 全部块仍被尝试（每块独立记日志），entries 仍全量返回供终评复用
+func TestRecordMarkDisconnectedBatchStoreError(t *testing.T) {
+	manager, _, store, _ := newRecordManagerFixture(t)
+	store.markErr = errors.New("db unavailable")
+
+	total := disconnectionShutdownChunkSize + 45 // 2 块：500 + 45
+	clients := make([]*models.Client, 0, total)
+	for i := 0; i < total; i++ {
+		clients = append(clients, models.NewClient(
+			"rec-err-"+strconv.Itoa(i),
+			"u-13"+strconv.Itoa(9000+i),
+			models.UserTypeCustomer,
+		))
+	}
+
+	var entries []*models.DisconnectionEntry
+	require.NotPanics(t, func() {
+		entries = manager.MarkDisconnectedBatch(clients)
+	})
+
+	chunks := store.disconnectChunks()
+	require.Len(t, chunks, 2, "错误不应中断分块：全部块均被尝试")
+	seen := make(map[string]bool, total)
+	for _, chunk := range chunks {
+		for _, e := range chunk {
+			seen[e.ConnectionID] = true
+		}
+	}
+	assert.Len(t, seen, total, "全部连接应被尝试标记")
+	require.Len(t, entries, total, "entries 返回不受仓储错误影响（终评复用契约）")
+	for _, e := range entries {
+		assert.Equal(t, models.DisconnectReasonServerShutdown, e.Reason)
+		assert.Equal(t, 1001, e.Code)
+	}
 }
 
 // TestRecordMarkDisconnectedBatchEmpty 空客户端列表：直调零次不 panic

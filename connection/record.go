@@ -17,6 +17,7 @@ package connection
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/kamalyes/go-sqlbuilder"
@@ -96,6 +97,10 @@ func (m *RecordManager) Save(ctx context.Context, record *models.ConnectionRecor
 // 参数，控制在三方言占位符上限内（PG 系 65535，MySQL max_allowed_packet 语境下亦安全）
 const disconnectionShutdownChunkSize = 500
 
+// disconnectionShutdownWorkers 停机批量直调的并行块数
+// 串行 26w 连接 = 520 块单线程耗时贴 grace 边缘，与 hub 停机清理共用 8 并发
+const disconnectionShutdownWorkers = 8
+
 // MarkDisconnected 标记连接为已断开（攒批路径，batcher 未注入时 no-op）
 // 构造 DisconnectionEntry 快照提交到 DisconnectionBatcher，由后台攒批合并为
 // CASE WHEN 单 SQL 落库；快照在断连瞬间冻结 DisconnectedAt/ConnectedAt，
@@ -140,14 +145,24 @@ func (m *RecordManager) MarkDisconnectedBatch(clients []*models.Client) []*model
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, disconnectionShutdownWorkers)
 	for start := 0; start < len(entries); start += disconnectionShutdownChunkSize {
 		end := min(start+disconnectionShutdownChunkSize, len(entries))
-		if err := m.store().BatchMarkDisconnected(ctx, entries[start:end]); err != nil {
-			m.logger.WarnContextKV(ctx, "shutdown: 批量标记连接断开失败",
-				"chunk_size", end-start,
-				"error", err,
-			)
-		}
+		chunk := entries[start:end]
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := m.store().BatchMarkDisconnected(ctx, chunk); err != nil {
+				m.logger.WarnContextKV(ctx, "shutdown: 批量标记连接断开失败",
+					"chunk_size", len(chunk),
+					"error", err,
+				)
+			}
+		}()
 	}
+	wg.Wait()
 	return entries
 }

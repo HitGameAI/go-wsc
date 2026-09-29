@@ -40,7 +40,16 @@ const (
 	// shutdownChunkSize 停机批量清理的分块大小（Redis 批量下线 / 质量终评 IN 批量的单批规模，
 	// 与连接记录断连分块同量级：单批 IN 列表与 CASE WHEN 参数量可控）
 	shutdownChunkSize = 500
+	// shutdownWorkers 停机批量清理的并行块数（Redis 下线/断连终态/质量终评共用，
+	// 与心跳续期并发同款模式；串行 26w 连接 = 520 块 ~57s 贴 90s grace 边缘，并行 8 压至 ~8-15s，过载窗口亦有 3 倍以上余量）
+	shutdownWorkers = 8
 )
+
+// shutdownFinalizeSkipAfter 清理段耗时超过此阈值则跳过质量终评——
+// 审计数据让位于按时退出，grace 耗尽被 SIGKILL 会导致全量连接裸 RST
+// （推导：Redis 下线最坏 10s + 断终 30s ctx 截止 = 40s 均已打满为极端过载，
+// 此时终评大概率也超时，跳过换取确定性退出；var 便于测试调小阈值验证熔断分支）
+var shutdownFinalizeSkipAfter = 40 * time.Second
 
 // Run 启动Hub
 func (h *Hub) Run() {
@@ -670,6 +679,7 @@ func (h *Hub) batchCleanupOnShutdown(clients []*models.Client) {
 	if len(clients) == 0 {
 		return
 	}
+	cleanupStart := time.Now()
 
 	// 统一设置活跃连接数为 0（只调一次，替代正常路径中每客户端一次的防抖同步）
 	if h.statsRepo != nil {
@@ -680,43 +690,76 @@ func (h *Hub) batchCleanupOnShutdown(clients []*models.Client) {
 		cancel()
 	}
 
-	// 批量清理 Redis 在线状态（分块批量下线，替代逐客户端 SetClientOffline：
+	// 批量清理 Redis 在线状态（分块并行批量下线，替代逐客户端 SetClientOffline；
+	// 并行受控 shutdownWorkers，与心跳续期同款 sem+wg 模式）
 	if h.onlineStatusRepo != nil {
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, shutdownWorkers)
 		for start := 0; start < len(clients); start += shutdownChunkSize {
 			end := mathx.Min(start+shutdownChunkSize, len(clients))
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if err := h.onlineStatusRepo.BatchSetClientsOfflineWithInfo(ctx, clients[start:end]); err != nil {
-				h.logger.WarnKV("shutdown: 批量清理 Redis 在线状态失败",
-					"error", err,
-					"chunk_size", end-start,
-				)
-			}
-			cancel()
+			chunk := clients[start:end]
+			wg.Add(1)
+			sem <- struct{}{}
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if err := h.onlineStatusRepo.BatchSetClientsOfflineWithInfo(ctx, chunk); err != nil {
+					h.logger.WarnKV("shutdown: 批量清理 Redis 在线状态失败",
+						"error", err,
+						"chunk_size", len(chunk),
+					)
+				}
+			}()
 		}
+		wg.Wait()
 	}
 
-	// 批量更新连接记录为断开（连接域：ServerShutdown + 1001 并行终态）
+	// 批量更新连接记录为断开（连接域：ServerShutdown + 1001 并行终态，块间并行见 record.go）
 	// 返回的 entries 含与 SQL 同源的 duration，供终评直接复用
 	entries := h.recordMgr.MarkDisconnectedBatch(clients)
 
 	// 批量质量终评（读质量行 + duration 算 FinalScore 写 quality_score）
-	// 分块批量：每连接 3 条 SQL（读质量行 + 读时长 + 写终评）压缩为每块 2 条，
-	// 旧逐连接路径 26w 连接 = 78w 条 SQL，是停机窗口 DB 过载主源
-	if h.connectionQualityStore != nil {
-		for start := 0; start < len(entries); start += shutdownChunkSize {
-			end := mathx.Min(start+shutdownChunkSize, len(entries))
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if err := h.connectionQualityStore.BatchFinalizeOnDisconnect(ctx, entries[start:end]); err != nil {
-				h.logger.WarnKV("shutdown: 批量质量终评失败",
-					"error", err,
-					"chunk_size", end-start,
-				)
+	// 分块并行：每连接 3 条 SQL（读质量行 + 读时长 + 写终评）压缩为每块 2 条，
+	// 旧逐连接路径 26w 连接 = 78w 条 SQL，是停机窗口 DB 过载主源；
+	// 清理段已超 shutdownFinalizeSkipAfter 说明 DB 极端过载（Redis 最坏 10s +
+	// 断终 30s ctx 截止均打满），跳过终评换取确定性退出
+	if h.connectionQualityStore != nil && len(entries) > 0 {
+		if elapsed := time.Since(cleanupStart); elapsed >= shutdownFinalizeSkipAfter {
+			h.logger.WarnKV("shutdown: 清理耗时超阈值，跳过批量质量终评",
+				"elapsed_ms", elapsed.Milliseconds(),
+				"entries", len(entries),
+			)
+		} else {
+			var wg sync.WaitGroup
+			sem := make(chan struct{}, shutdownWorkers)
+			for start := 0; start < len(entries); start += shutdownChunkSize {
+				end := mathx.Min(start+shutdownChunkSize, len(entries))
+				chunk := entries[start:end]
+				wg.Add(1)
+				sem <- struct{}{}
+				go func() {
+					defer wg.Done()
+					defer func() { <-sem }()
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					if err := h.connectionQualityStore.BatchFinalizeOnDisconnect(ctx, chunk); err != nil {
+						h.logger.WarnKV("shutdown: 批量质量终评失败",
+							"error", err,
+							"chunk_size", len(chunk),
+						)
+					}
+				}()
 			}
-			cancel()
+			wg.Wait()
 		}
 	}
 
-	h.logger.InfoKV("shutdown: 批量清理完成", "client_count", len(clients))
+	h.logger.InfoKV("shutdown: 批量清理完成",
+		"client_count", len(clients),
+		"elapsed_ms", time.Since(cleanupStart).Milliseconds(),
+	)
 }
 
 // ============================================================================
