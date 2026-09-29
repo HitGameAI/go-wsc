@@ -135,6 +135,17 @@ return 1
 `
 )
 
+// Lua 脚本 EVALSHA 注册：优先传 40 字节 SHA（NOSCRIPT 自动降级 EVAL 全文并缓存），
+// 统计路径每次连接事件/心跳刷写触发，免 5KB 脚本文本重复传输与解析
+var (
+	luaHIncrByWithExpireScript           = redis.NewScript(luaHIncrByWithExpire)
+	luaHIncrByWithExpireAndNodeSetScript = redis.NewScript(luaHIncrByWithExpireAndNodeSet)
+	luaHSetWithExpireScript              = redis.NewScript(luaHSetWithExpire)
+	luaUpdateConnectionStatsScript       = redis.NewScript(luaUpdateConnectionStats)
+	luaRegisterNodeScript                = redis.NewScript(luaRegisterNode)
+	luaCleanupNodeStatsScript            = redis.NewScript(luaCleanupNodeStats)
+)
+
 // NodeStats / ClusterStats 已迁至 models/contract.go —— 它们是 spi.HubStats 接口
 // 签名的一部分，接口层不应反向依赖本包。
 
@@ -191,7 +202,7 @@ func (r *HubStats) UpdateConnectionStats(ctx context.Context, nodeID string, act
 		time.Now().Unix(),
 		r.expireRefreshThreshold,
 	}
-	return r.client.Eval(ctx, luaUpdateConnectionStats, keys, args...).Err()
+	return luaUpdateConnectionStatsScript.Run(ctx, r.client, keys, args...).Err()
 }
 
 // IncrementTotalConnections 增加总连接数
@@ -205,7 +216,7 @@ func (r *HubStats) IncrementTotalConnections(ctx context.Context, nodeID string,
 		int64(r.statsExpire.Seconds()),
 		r.expireRefreshThreshold,
 	}
-	return r.client.Eval(ctx, luaHIncrByWithExpireAndNodeSet, keys, args...).Err()
+	return luaHIncrByWithExpireAndNodeSetScript.Run(ctx, r.client, keys, args...).Err()
 }
 
 // SetActiveConnections 设置当前活跃连接数
@@ -218,7 +229,7 @@ func (r *HubStats) SetActiveConnections(ctx context.Context, nodeID string, coun
 		int64(r.statsExpire.Seconds()),
 		r.expireRefreshThreshold,
 	}
-	return r.client.Eval(ctx, luaHSetWithExpire, keys, args...).Err()
+	return luaHSetWithExpireScript.Run(ctx, r.client, keys, args...).Err()
 }
 
 // IncrementMessagesSent 增加已发送消息数
@@ -231,7 +242,7 @@ func (r *HubStats) IncrementMessagesSent(ctx context.Context, nodeID string, del
 		int64(r.statsExpire.Seconds()),
 		r.expireRefreshThreshold,
 	}
-	return r.client.Eval(ctx, luaHIncrByWithExpire, keys, args...).Err()
+	return luaHIncrByWithExpireScript.Run(ctx, r.client, keys, args...).Err()
 }
 
 // IncrementMessagesReceived 增加已接收消息数
@@ -244,7 +255,7 @@ func (r *HubStats) IncrementMessagesReceived(ctx context.Context, nodeID string,
 		int64(r.statsExpire.Seconds()),
 		r.expireRefreshThreshold,
 	}
-	return r.client.Eval(ctx, luaHIncrByWithExpire, keys, args...).Err()
+	return luaHIncrByWithExpireScript.Run(ctx, r.client, keys, args...).Err()
 }
 
 // IncrementBroadcastsSent 增加已发送广播数
@@ -257,7 +268,7 @@ func (r *HubStats) IncrementBroadcastsSent(ctx context.Context, nodeID string, d
 		int64(r.statsExpire.Seconds()),
 		r.expireRefreshThreshold,
 	}
-	return r.client.Eval(ctx, luaHIncrByWithExpire, keys, args...).Err()
+	return luaHIncrByWithExpireScript.Run(ctx, r.client, keys, args...).Err()
 }
 
 // RegisterNode 注册节点并初始化统计信息
@@ -269,7 +280,7 @@ func (r *HubStats) RegisterNode(ctx context.Context, nodeID string, startTime in
 		startTime,
 		int64(r.statsExpire.Seconds()),
 	}
-	return r.client.Eval(ctx, luaRegisterNode, keys, args...).Err()
+	return luaRegisterNodeScript.Run(ctx, r.client, keys, args...).Err()
 }
 
 // UpdateNodeHeartbeat 更新节点心跳时间
@@ -407,7 +418,7 @@ func (r *HubStats) GetActiveNodes(ctx context.Context, timeout time.Duration) ([
 func (r *HubStats) CleanupNodeStats(ctx context.Context, nodeID string) error {
 	keys := []string{r.GetNodeKey(nodeID), r.GetHeartbeatKey(nodeID), r.GetNodesSetKey()}
 	args := []any{nodeID}
-	return r.client.Eval(ctx, luaCleanupNodeStats, keys, args...).Err()
+	return luaCleanupNodeStatsScript.Run(ctx, r.client, keys, args...).Err()
 }
 
 // 编译期断言：repository 实现必须满足 spi 契约（Phase 4 迁仓后适配器同样受此约束）

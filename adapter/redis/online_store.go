@@ -57,8 +57,11 @@ func clientMatchesRouteEnvelope(client *models.Client, appID, namespace string) 
 }
 
 const (
-	// maxBatchSize 单次 Lua 脚本处理的最大客户端数量，避免 Redis 阻塞
-	maxBatchSize = 100
+	// maxBatchSize 单次 Lua 脚本处理的最大客户端数量
+	// 双重约束：既限制脚本参数规模，更限制单次不可抢占原子块时长——valkey 单线程
+	// 期间所有其他命令排队，50 客户端/批约 650 条命令（6-8ms）是压测验证的
+	// 排队尾延迟与批量摊薄 RTT 的平衡点（100/批时原子块 12-15ms，业务命令最坏排队翻倍）
+	maxBatchSize = 50
 	// compressionThreshold 压缩阈值，低于此大小不压缩（小数据压缩反而增大）
 	compressionThreshold = 512
 )
@@ -219,6 +222,8 @@ local clientCount = tonumber(ARGV[3])
 local bitmapTTL = tonumber(ARGV[4])
 local maxOffset = tonumber(ARGV[5])
 local successCount = 0
+-- 批内 EXPIRE 去重：node_clients 同批全同 key（同节点批量上线），EXPIRE 只发一次
+local ncExpired = {}
 
 for i = 1, clientCount do
     local idx = 5 + i
@@ -284,8 +289,12 @@ for i = 1, clientCount do
         redis.call('EXPIRE', unscopedUserClientsKey, ttl)
         redis.call('ZADD', nodeClientsKey, expireTime, clientID)
         -- node_clients 同步续 key TTL：活节点被心跳持续刷新永不过期，崩溃节点无人续期、
-        -- 整 key 在 ttl 后自动消失（CleanupExpired 只清存活节点自己的 key，崩溃节点无人认领）
-        redis.call('EXPIRE', nodeClientsKey, ttl)
+        -- 整 key 在 ttl 后自动消失（CleanupExpired 只清存活节点自己的 key，崩溃节点无人认领）；
+        -- 同批全同节点，EXPIRE 批内去重只发一次
+        if not ncExpired[nodeClientsKey] then
+            redis.call('EXPIRE', nodeClientsKey, ttl)
+            ncExpired[nodeClientsKey] = true
+        end
         redis.call('ZADD', allUsersKey, expireTime, userID)
         redis.call('ZADD', typeKey, expireTime, userID)
         -- types 集合登记（CleanupExpired 据此遍历所有 type ZSET，幂等）
@@ -352,7 +361,15 @@ local maxOffset = tonumber(ARGV[5])
 local expireTime = currentTime + ttl
 local missing = {}
 local bmRefreshed = {}
-local nodesExpired = {}
+-- 批内 EXPIRE 去重：同 key 只续一次 TTL（EXPIRE 幂等，重复发送纯属浪费；
+-- 同节点 node_clients 批内 50 客户端全同 key，同用户多端的 user_clients 亦常重复）
+local expiredKeys = {}
+local function expireOnce(key)
+    if not expiredKeys[key] then
+        redis.call('EXPIRE', key, ttl)
+        expiredKeys[key] = true
+    end
+end
 
 for i = 1, clientCount do
     local data = ARGV[5 + i]
@@ -395,14 +412,14 @@ for i = 1, clientCount do
             redis.call('EXPIRE', clientKey, ttl)
             redis.call('EXPIRE', keyPrefix .. "owner:" .. clientID, ttl)
 
-            -- 2. ZADD 刷新 score（过期时间戳随本次续期前移）
+            -- 2. ZADD 刷新 score（过期时间戳随本次续期前移），同 key EXPIRE 批内去重
             redis.call('ZADD', scopedUserClientsKey, expireTime, clientID)
-            redis.call('EXPIRE', scopedUserClientsKey, ttl)
+            expireOnce(scopedUserClientsKey)
             redis.call('ZADD', unscopedUserClientsKey, expireTime, clientID)
-            redis.call('EXPIRE', unscopedUserClientsKey, ttl)
+            expireOnce(unscopedUserClientsKey)
             redis.call('ZADD', nodeClientsKey, expireTime, clientID)
             -- node_clients key TTL 随心跳刷新（崩溃节点 ttl 后整 key 自动消失，防泄漏）
-            redis.call('EXPIRE', nodeClientsKey, ttl)
+            expireOnce(nodeClientsKey)
             redis.call('ZADD', allUsersKey, expireTime, userID)
             redis.call('ZADD', typeKey, expireTime, userID)
 
@@ -410,15 +427,11 @@ for i = 1, clientCount do
             redis.call('SADD', keyPrefix .. "types", userType)
 
             -- 3.5 节点桶续期（score 前移至本次心跳过期点 + 桶 key TTL 刷新，member="<ns>:<nodeID>"）
-            --     批内同 key EXPIRE 去重（同用户多端同批心跳，与 bmRefreshed 同模式摊薄命令数）；
             --     ZADD 幂等（同批 now 相同 → expireTime 相同，重复写同 member 无害）；
             --     不做 ZREMRANGEBYSCORE：死条目由读取侧 ZRangeByScore 过滤，心跳高频路径命令数压到最低
             local userNodesKey = keyPrefix .. "nodes:" .. appID .. ":" .. userID
             redis.call('ZADD', userNodesKey, expireTime, ns .. ":" .. nodeID)
-            if not nodesExpired[userNodesKey] then
-                redis.call('EXPIRE', userNodesKey, ttl)
-                nodesExpired[userNodesKey] = true
-            end
+            expireOnce(userNodesKey)
 
             -- 4. bitmap 续期（摊薄刷新：TTL 剩余超过半程且本批未刷新过则跳过，
             --    bit 已为 1（上线路径写入），跳过仅推迟 EXPIRE，不影响判否正确性）
@@ -560,6 +573,23 @@ end
 
 return successCount
 `
+
+// ============================================================================
+// Lua 脚本 EVALSHA 注册
+//
+// redis.NewScript 优先 EVALSHA（仅传 40 字节 SHA），NOSCRIPT 时自动降级为
+// EVAL 全文并加载缓存，服务端脚本缓存失效（重启/SCRIPT FLUSH）自动自愈。
+// 在线状态热路径（心跳续期/批量上下线）每秒数十次调用，裸 EVAL 每次重传
+// 5KB 脚本文本，改 EVALSHA 后省带宽与 valkey 侧脚本重复解析开销
+// ============================================================================
+
+var (
+	luaIsUserOnlineScript           = redis.NewScript(luaIsUserOnline)
+	luaBatchSetClientsOnlineScript  = redis.NewScript(luaBatchSetClientsOnline)
+	luaRenewClientsOnlineScript     = redis.NewScript(luaRenewClientsOnline)
+	luaBatchSetClientsOfflineScript = redis.NewScript(luaBatchSetClientsOffline)
+	luaCleanupExpiredClientsScript  = redis.NewScript(luaCleanupExpiredClients)
+)
 
 // OnlineStore Redis 实现
 type OnlineStore struct {
@@ -751,7 +781,7 @@ func (r *OnlineStore) SetClientOffline(ctx context.Context, client *models.Clien
 
 	// 使用 Lua 脚本删除
 	keys := []string{r.keyPrefix}
-	_, err := r.client.Eval(ctx, luaBatchSetClientsOffline, keys, args...).Result()
+	_, err := luaBatchSetClientsOfflineScript.Run(ctx, r.client, keys, args...).Result()
 	if err != nil {
 		return errorx.WrapError("failed to execute lua script", err)
 	}
@@ -1128,7 +1158,7 @@ func (r *OnlineStore) IsUserOnline(ctx context.Context, userID string) (bool, er
 		// L1 未命中：Lua 原子查询 HGET uid_map → GETBIT，成功时回填 offset
 		keys := []string{r.uidMapKey(userID), bitmapKey}
 		args := []any{userID, r.maxBitmapOffset}
-		luaResult, err := r.client.Eval(ctx, luaIsUserOnline, keys, args...).Result()
+		luaResult, err := luaIsUserOnlineScript.Run(ctx, r.client, keys, args...).Result()
 		if err == nil {
 			if arr, ok := luaResult.([]interface{}); ok && len(arr) == 2 {
 				ret, _ := arr[0].(int64)
@@ -1464,7 +1494,7 @@ func (r *OnlineStore) BatchSetClientsOnline(ctx context.Context, clients []*mode
 			args = append(args, clientData)
 		}
 
-		if _, err := r.client.Eval(ctx, luaBatchSetClientsOnline, keys, args...).Result(); err != nil {
+		if _, err := luaBatchSetClientsOnlineScript.Run(ctx, r.client, keys, args...).Result(); err != nil {
 			return errorx.WrapError("failed to execute batch lua script", err)
 		}
 	}
@@ -1519,7 +1549,7 @@ func (r *OnlineStore) RenewClientsOnline(ctx context.Context, clients []*models.
 			args = append(args, clientData)
 		}
 
-		result, err := r.client.Eval(ctx, luaRenewClientsOnline, keys, args...).Result()
+		result, err := luaRenewClientsOnlineScript.Run(ctx, r.client, keys, args...).Result()
 		if err != nil {
 			return errorx.WrapError("failed to execute renew lua script", err)
 		}
@@ -1598,7 +1628,7 @@ func (r *OnlineStore) BatchSetClientsOffline(ctx context.Context, clientIDs []st
 
 	// 使用 Lua 脚本批量删除
 	keys := []string{r.keyPrefix}
-	_, err = r.client.Eval(ctx, luaBatchSetClientsOffline, keys, args...).Result()
+	_, err = luaBatchSetClientsOfflineScript.Run(ctx, r.client, keys, args...).Result()
 	if err != nil {
 		return errorx.WrapError("failed to execute batch lua script", err)
 	}
@@ -1624,7 +1654,7 @@ func (r *OnlineStore) BatchSetClientsOfflineWithInfo(ctx context.Context, client
 
 	// 使用 Lua 脚本批量删除
 	keys := []string{r.keyPrefix}
-	_, err := r.client.Eval(ctx, luaBatchSetClientsOffline, keys, args...).Result()
+	_, err := luaBatchSetClientsOfflineScript.Run(ctx, r.client, keys, args...).Result()
 	if err != nil {
 		return errorx.WrapError("failed to execute batch lua script", err)
 	}
@@ -1659,7 +1689,7 @@ func (r *OnlineStore) CleanupExpired(ctx context.Context, nodeID string) (int64,
 	// batchCount 个周期全覆盖；并发调用（不应发生）也只是批次重复/跳过，清理幂等无碍
 	batchIndex := r.cleanupBatch.Add(1) - 1
 
-	result, err := r.client.Eval(ctx, luaCleanupExpiredClients, []string{r.keyPrefix, nodeClientsKey},
+	result, err := luaCleanupExpiredClientsScript.Run(ctx, r.client, []string{r.keyPrefix, nodeClientsKey},
 		nodeID, currentTime, constants.DefaultKeyBucketCount,
 		constants.DefaultCleanupBatchCount, batchIndex%uint32(constants.DefaultCleanupBatchCount),
 	).Result()

@@ -86,10 +86,10 @@ func (r *GroupStore) namespacesKey(appID string) string {
 // 群组元信息管理
 // ============================================================================
 
-// createGroupScript Lua 脚本：原子性的校验同 (appID, namespace) 下 groupID 唯一并写入元信息、命名空间索引、实例索引与 nss 显式索引
+// createGroupLua Lua 脚本：原子性的校验同 (appID, namespace) 下 groupID 唯一并写入元信息、命名空间索引、实例索引与 nss 显式索引
 // KEYS[1]=info 三维元信息 / KEYS[2]=ns 归属索引 / KEYS[3]=gns 跨 ns 实例索引 / KEYS[4]=nss 命名空间显式索引；ARGV[1]=元信息 JSON / ARGV[2]=groupID / ARGV[3]=namespace
 // 返回 1 表示创建成功，0 表示群组已存在
-const createGroupScript = `
+const createGroupLua = `
 if redis.call("exists", KEYS[1]) == 1 then
 	return 0
 end
@@ -100,19 +100,26 @@ redis.call("sadd", KEYS[4], ARGV[3])
 return 1
 `
 
-// disbandNsIndexScript Lua 脚本：原子维护解散侧的命名空间索引
+// disbandNsIndexLua Lua 脚本：原子维护解散侧的命名空间索引
 // KEYS[1]=ns 归属索引 / KEYS[2]=nss 命名空间显式索引；ARGV[1]=groupID / ARGV[2]=namespace
 // ns 下已无群组（SCARD==0）时同步从 nss 显式索引移除，保证 GetAllNamespaces 零空残留
 // SCARD 判定必须与 SREM 同脚本原子：拆两步会留下"ns 已空但 nss 仍登记"的广播侧幻影租户
 // 返回 ns 剩余群组数（脚本必须显式 return，nil 返回会被 go-redis 转为 redis.Nil 错误）
-const disbandNsIndexScript = `
+const disbandNsIndexLua = `
 redis.call("srem", KEYS[1], ARGV[1])
 local remaining = redis.call("scard", KEYS[1])
 if remaining == 0 then
-	redis.call("srem", KEYS[2], ARGV[2])
+    redis.call("srem", KEYS[2], ARGV[2])
 end
 return remaining
 `
+
+// Lua 脚本 EVALSHA 注册：优先传 40 字节 SHA（NOSCRIPT 自动降级 EVAL 全文并缓存），
+// 建组/系统组保障在连接风暴期高频触发，免脚本文本重复传输与解析
+var (
+	createGroupScript    = redis.NewScript(createGroupLua)
+	disbandNsIndexScript = redis.NewScript(disbandNsIndexLua)
+)
 
 // CreateGroup 创建业务群组
 // 禁止使用系统保留名（__ 前缀），同 (appID, namespace) groupID 唯一，重复创建返回 models.ErrGroupExisted
@@ -141,7 +148,7 @@ func (r *GroupStore) createGroupUnchecked(ctx context.Context, group *models.Gro
 	if err != nil {
 		return errorx.WrapError("marshal group failed", err)
 	}
-	result, err := r.client.Eval(ctx, createGroupScript,
+	result, err := createGroupScript.Run(ctx, r.client,
 		[]string{r.infoKey(appID, namespace, group.GroupID), r.namespaceGroupsKey(appID, namespace), r.groupInstancesKey(appID, group.GroupID), r.namespacesKey(appID)},
 		data, group.GroupID, namespace,
 	).Result()
@@ -158,7 +165,7 @@ func (r *GroupStore) createGroupUnchecked(ctx context.Context, group *models.Gro
 // EnsureSystemGroup 确保系统保留组存在（agent/observer 自动加入前初始化）
 //
 // 幂等：不存在则创建，已存在则返回 nil仅允许 __ 前缀系统组名
-// 复用 createGroupScript，返回 0（已存在）/1（新建）均视为成功，天然处理并发竞态
+// 复用 createGroupLua（经 createGroupScript EVALSHA 执行），返回 0（已存在）/1（新建）均视为成功，天然处理并发竞态
 func (r *GroupStore) EnsureSystemGroup(ctx context.Context, appID, namespace, groupID string) error {
 	if !models.IsSystemGroup(groupID) {
 		return models.ErrGroupReserved
@@ -178,7 +185,7 @@ func (r *GroupStore) EnsureSystemGroup(ctx context.Context, appID, namespace, gr
 	if err != nil {
 		return errorx.WrapError("marshal system group failed", err)
 	}
-	if _, err := r.client.Eval(ctx, createGroupScript,
+	if _, err := createGroupScript.Run(ctx, r.client,
 		[]string{r.infoKey(appID, namespace, groupID), r.namespaceGroupsKey(appID, namespace), r.groupInstancesKey(appID, groupID), r.namespacesKey(appID)},
 		data, groupID, namespace,
 	).Result(); err != nil {
@@ -225,7 +232,7 @@ func (r *GroupStore) DisbandGroup(ctx context.Context, appID, namespace, groupID
 	}
 	// ns 归属索引与 nss 显式索引的收缩经 Lua 原子完成（SCARD==0 时同步从 nss 移除），
 	// 保证 GetAllNamespaces 零空残留
-	_, err = r.client.Eval(ctx, disbandNsIndexScript,
+	_, err = disbandNsIndexScript.Run(ctx, r.client,
 		[]string{r.namespaceGroupsKey(appID, namespace), r.namespacesKey(appID)},
 		groupID, namespace,
 	).Result()
