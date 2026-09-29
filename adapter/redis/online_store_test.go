@@ -2,9 +2,9 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2026-09-16 10:30:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2026-09-16 10:30:00
+ * @LastEditTime: 2026-09-30 00:16:08
  * @FilePath: \go-wsc\adapter\redis\online_store_test.go
- * @Description: OnlineStore 在线仓库回归测试（三大主题合并）
+ * @Description: OnlineStore 在线仓库回归测试（四大主题合并）
  *
  *   1. 路由信封隔离：IsUserOnline/GetUserClients/GetUserNodes/BatchGetUserNodes
  *      按 ctx 路由信封 appID+namespace 过滤，避免同名 userID 跨租户误判。
@@ -14,6 +14,10 @@
  *
  *   3. 全局聚合查询：GetAllOnlineUsers/GetOnlineCount/GetOnlineUsersByType/
  *      GetNodeClients 分桶遍历与 ZCOUNT 求和，ZRANGEBYSCORE 服务端过滤过期死条目。
+ *
+ *   4. 过期清理轮转分批：CleanupExpired 每次只清 1/DefaultCleanupBatchCount 的桶
+ *      （批次由 cleanupBatch 原子轮转），batchCount 个周期全覆盖；node_clients
+ *      单 key 每次全清，未过期成员不受影响（渐进清理语义无损）。
  *
  * 刻意跑真实 miniredis 实现：这组方法断言的是 ZSET 分桶聚合、score 过期过滤与
  * 信封隔离语义，用内存替身只会测替身自身，拿不到实现正确性证据。
@@ -538,4 +542,89 @@ func TestGetNodeClients_FiltersExpired(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, clients, 1, "过期死条目应被过滤")
 	assert.Equal(t, "c-1", clients[0].ID)
+}
+
+// ============================================================================
+// 主题四：过期清理轮转分批
+// ============================================================================
+
+// TestCleanupExpired_RotatingBatchCoverage 验证轮转分批清理的渐进性与覆盖性
+//
+// 桶号 b 归属批次 b%DefaultCleanupBatchCount：CleanupExpired 首次清批次 0（桶 0,8,16,...），未轮到批次的过期成员保留；连续调用 batchCount 次后
+// 所有桶全覆盖；未过期成员与 node_clients 活条目全程不受影响
+func TestCleanupExpired_RotatingBatchCoverage(t *testing.T) {
+	t.Parallel()
+	repo, client := setupOnlineStore(t)
+	ctx := context.Background()
+
+	// 空 nodeID 直接报错
+	_, err := repo.CleanupExpired(ctx, "")
+	require.Error(t, err, "空 nodeID 应报错")
+
+	expiredAt := time.Now().Unix() - 100
+	liveUntil := time.Now().Unix() + 60
+
+	// 手动登记 types（与上线 Lua 的 SADD 对齐，CleanupExpired 据此遍历 type ZSET）
+	require.NoError(t, client.SAdd(ctx, repo.keyPrefix+"types", models.UserTypeCustomer.String()).Err())
+
+	// 桶 0..7 分属 8 个轮转批次，每桶注入 1 个过期成员（all_users + type 双写）
+	for b := 0; b < constants.DefaultCleanupBatchCount; b++ {
+		stale := redis.Z{Score: float64(expiredAt), Member: fmt.Sprintf("stale-user-%d", b)}
+		require.NoError(t, client.ZAdd(ctx, repo.allUsersBucketKey(b), stale).Err())
+		require.NoError(t, client.ZAdd(ctx, repo.userTypeBucketKey(models.UserTypeCustomer, b), stale).Err())
+	}
+
+	// 批次 0 的桶 0 额外注入未过期成员：轮转清理不得误伤活成员
+	require.NoError(t, client.ZAdd(ctx, repo.allUsersBucketKey(0), redis.Z{
+		Score:  float64(liveUntil),
+		Member: "live-user",
+	}).Err())
+
+	// node_clients 注入过期条目（单 key，每次全清）与未过期条目（应保留）
+	ncKey := repo.nodeClientsKey("node-x")
+	require.NoError(t, client.ZAdd(ctx, ncKey, redis.Z{Score: float64(expiredAt), Member: "stale-client"}).Err())
+	require.NoError(t, client.ZAdd(ctx, ncKey, redis.Z{Score: float64(liveUntil), Member: "live-client"}).Err())
+
+	// 首次清理：批次 0（桶 0,8,16,...），返回值只计 node_clients 全清数
+	cleaned, err := repo.CleanupExpired(ctx, "node-x")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), cleaned, "node_clients 单 key 每次全清，首次应清 1 个过期客户端")
+
+	// 桶 0：过期成员已清、未过期成员保留
+	members, err := client.ZRangeByScore(ctx, repo.allUsersBucketKey(0), &redis.ZRangeBy{Min: "-inf", Max: "+inf"}).Result()
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"live-user"}, members, "批次 0 清理后桶 0 只剩未过期成员")
+
+	// 桶 1..7：属于未轮到的批次，过期成员保留（渐进清理）
+	for b := 1; b < constants.DefaultCleanupBatchCount; b++ {
+		n, err := client.ZCard(ctx, repo.allUsersBucketKey(b)).Result()
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), n, "未轮到的批次，桶 %d 的过期成员应保留", b)
+	}
+
+	// 连续调用补齐其余批次，batchCount 个周期全覆盖
+	for i := 1; i < constants.DefaultCleanupBatchCount; i++ {
+		_, err := repo.CleanupExpired(ctx, "node-x")
+		require.NoError(t, err)
+	}
+
+	// 全覆盖后：所有 all_users 桶与 type 桶的过期成员清空，活成员保留
+	for b := 0; b < constants.DefaultCleanupBatchCount; b++ {
+		members, err := client.ZRangeByScore(ctx, repo.allUsersBucketKey(b), &redis.ZRangeBy{Min: "-inf", Max: "+inf"}).Result()
+		require.NoError(t, err)
+		if b == 0 {
+			assert.ElementsMatch(t, []string{"live-user"}, members, "全覆盖后桶 0 只剩未过期成员")
+		} else {
+			assert.Empty(t, members, "全覆盖后桶 %d 的过期成员应清空", b)
+		}
+
+		typeMembers, err := client.ZRangeByScore(ctx, repo.userTypeBucketKey(models.UserTypeCustomer, b), &redis.ZRangeBy{Min: "-inf", Max: "+inf"}).Result()
+		require.NoError(t, err)
+		assert.Empty(t, typeMembers, "全覆盖后 type 桶 %d 应清空", b)
+	}
+
+	// node_clients 只剩未过期客户端
+	ncMembers, err := client.ZRangeByScore(ctx, ncKey, &redis.ZRangeBy{Min: "-inf", Max: "+inf"}).Result()
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"live-client"}, ncMembers, "node_clients 只剩未过期客户端")
 }

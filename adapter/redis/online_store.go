@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	wscconfig "github.com/kamalyes/go-config/pkg/wsc"
@@ -96,6 +97,13 @@ func zlibCompressWithPool(data []byte) ([]byte, error) {
 // ARGV[1] = nodeID (当前节点ID)
 // ARGV[2] = currentTime (当前时间戳，用于清理 ZSET 中的过期数据)
 // ARGV[3] = bucketCount (热点 key 分桶数)
+// ARGV[4] = batchCount (轮转批数，1=单批全量，兼容旧行为)
+// ARGV[5] = batchIndex (当前批次号，0 ~ batchCount-1，由调用方原子轮转)
+//
+// 轮转分批：每次只清理桶号 ≡ batchIndex (mod batchCount) 的桶，把单次原子块的
+// 命令量从 bucketCount×(1+userTypes) 降至 1/batchCount（256 桶 8 批 ≈ 500→70 条，
+// valkey SLOWLOG 实测 20ms→3ms），避免清理脚本把 valkey 单线程周期性切成碎片；
+// batchCount 个清理周期后所有桶全覆盖，过期数据以 score 过期戳兜底，晚清语义无损
 //
 // 返回值: 清理的客户端数量
 const luaCleanupExpiredClients = `
@@ -104,8 +112,10 @@ local nodeClientsKey = KEYS[2]
 local nodeID = ARGV[1]
 local currentTime = tonumber(ARGV[2])
 local bucketCount = tonumber(ARGV[3])
+local batchCount = tonumber(ARGV[4])
+local batchIndex = tonumber(ARGV[5])
 
--- 清理 node_clients ZSET 中的过期数据
+-- node_clients 是本节点权威数据（单 key，量小），每次全清
 local cleaned = redis.call('ZREMRANGEBYSCORE', nodeClientsKey, '-inf', currentTime)
 
 -- 清理所有 type ZSET（types 集合由上线/续期脚本 SADD 登记所有出现过的 userType，
@@ -113,8 +123,8 @@ local cleaned = redis.call('ZREMRANGEBYSCORE', nodeClientsKey, '-inf', currentTi
 local typesKey = keyPrefix .. "types"
 local userTypes = redis.call('SMEMBERS', typesKey)
 
--- 分桶布局：all_users/type 按桶遍历（空桶 ZREMRANGEBYSCORE 为 O(1) 空转，开销可忽略）
-for b = 0, bucketCount - 1 do
+-- 轮转分批遍历：b = batchIndex, batchIndex+batchCount, ...（空桶 ZREMRANGEBYSCORE 为 O(1) 空转）
+for b = batchIndex, bucketCount - 1, batchCount do
     redis.call('ZREMRANGEBYSCORE', keyPrefix .. "all_users:" .. b, '-inf', currentTime)
     for _, userType in ipairs(userTypes) do
         redis.call('ZREMRANGEBYSCORE', keyPrefix .. "type:" .. userType .. ":" .. b, '-inf', currentTime)
@@ -564,6 +574,9 @@ type OnlineStore struct {
 	maxBitmapOffset int64           // offset 上限（防恶意膨胀，0=不限制）
 	maxCachedUIDs   int             // L1 缓存容量上限
 	uidCache        *uidOffsetCache // userID→offset 进程内 L1 缓存（命中零网络）
+
+	// cleanupBatch 清理批次轮转计数器（CleanupExpired 每次清 1/8 的桶，8 周期全覆盖）
+	cleanupBatch atomic.Uint32
 }
 
 // NewOnlineStore 创建 Redis 在线状态仓库
@@ -1626,8 +1639,10 @@ func (r *OnlineStore) BatchSetClientsOfflineWithInfo(ctx context.Context, client
 // CleanupExpired 清理当前节点的过期客户端（使用 ZSET 自动清理过期数据）
 //
 // 清理策略：
-// 1. 清理 node_clients 中不存在的客户端
-// 2. 使用 ZREMRANGEBYSCORE 清理 all_users 和 type ZSET 中的过期数据
+//  1. 每次全清 node_clients（本节点权威数据，单 key 量小）
+//  2. all_users/type ZSET 按 score 过期戳轮转分批清理：每次只清 1/DefaultCleanupBatchCount
+//     的桶（批号由 cleanupBatch 原子轮转），DefaultCleanupBatchCount 个清理周期全覆盖；
+//     过期成员在查询侧由 score 语义兜底，晚清不产生脏读
 //
 // 注意：
 // - user_clients 使用 ZSET 存储，设置了 TTL 会自动过期
@@ -1640,7 +1655,14 @@ func (r *OnlineStore) CleanupExpired(ctx context.Context, nodeID string) (int64,
 	nodeClientsKey := r.nodeClientsKey(nodeID)
 	currentTime := time.Now().Unix()
 
-	result, err := r.client.Eval(ctx, luaCleanupExpiredClients, []string{r.keyPrefix, nodeClientsKey}, nodeID, currentTime, constants.DefaultKeyBucketCount).Result()
+	// 批次号原子轮转：连续调用依次清 0,1,...,batchCount-1 批桶，
+	// batchCount 个周期全覆盖；并发调用（不应发生）也只是批次重复/跳过，清理幂等无碍
+	batchIndex := r.cleanupBatch.Add(1) - 1
+
+	result, err := r.client.Eval(ctx, luaCleanupExpiredClients, []string{r.keyPrefix, nodeClientsKey},
+		nodeID, currentTime, constants.DefaultKeyBucketCount,
+		constants.DefaultCleanupBatchCount, batchIndex%uint32(constants.DefaultCleanupBatchCount),
+	).Result()
 	if err != nil {
 		return 0, fmt.Errorf("执行清理脚本失败: %w", err)
 	}

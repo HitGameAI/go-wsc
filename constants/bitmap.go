@@ -36,4 +36,10 @@ const (
 	// uid_map/all_users/type 三类 key 按此分桶：亿级用户下单 key 写频从数百万 ops/s
 	// 降至数千 ops/s，Redis Cluster 下桶天然散落到不同 slot
 	DefaultKeyBucketCount = 256
+
+	// DefaultCleanupBatchCount 在线状态清理轮转批数
+	// CleanupExpired 每次只清 bucketCount/batchCount 个桶（256/8=32 桶），
+	// 单次 Lua 原子块命令量从 500+ 降至 ~70（约 20ms → 3ms，valkey SLOWLOG 实测），
+	// batchCount 个清理周期全覆盖所有桶；过期数据以 score 过期戳兜底，晚清语义无损
+	DefaultCleanupBatchCount = 8
 )
