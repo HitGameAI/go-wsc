@@ -151,10 +151,9 @@ func (r *MessageSink) FindRetryable(ctx context.Context, limit int) ([]*models.M
 }
 
 // DeleteExpired 删除过期的记录
-// 硬删：过期记录无回溯消费方，软删会让行滞留表内，expires_at 索引扫随历史软删行累积越来越慢
 func (r *MessageSink) DeleteExpired(ctx context.Context) (int64, error) {
 	now := time.Now()
-	result := r.db.WithContext(ctx).Unscoped().Where("expires_at IS NOT NULL AND expires_at < ?", now).Delete(&models.MessageSendRecord{})
+	result := r.db.WithContext(ctx).Where("expires_at IS NOT NULL AND expires_at < ?", now).Delete(&models.MessageSendRecord{})
 	return result.RowsAffected, result.Error
 }
 
