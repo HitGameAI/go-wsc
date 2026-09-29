@@ -130,30 +130,77 @@ func (r *ConnectionStore) Upsert(ctx context.Context, record *models.ConnectionR
 	return r.BatchUpsert(ctx, []*models.ConnectionRecord{record})
 }
 
-// MarkDisconnected 标记连接为已断开
-// 写 duration/disconnected_at/is_abnormal 等会话终态字段，供 qualityRepo.FinalizeOnDisconnect 读 duration 算终评
-// connectedAt 由调用方从内存 Client 带入，直接 UPDATE 不再前置 SELECT（断连风暴下每断一连接省 1 次 DB 往返）；
-// UPDATE 影响 0 行（记录已被清理）与原 SELECT 找不到记录语义一致，静默返回
-func (r *ConnectionStore) MarkDisconnected(ctx context.Context, connectionID string, connectedAt time.Time, reason models.DisconnectReason, code int) error {
-	now := time.Now()
-	duration := int64(0)
-	if !connectedAt.IsZero() {
-		duration = int64(now.Sub(connectedAt).Seconds())
-	}
-	isAbnormal := reason != models.DisconnectReasonClientRequest && reason != models.DisconnectReasonServerShutdown
-
-	updates := map[string]any{
-		"disconnected_at":   now,
-		"disconnect_reason": string(reason),
-		"disconnect_code":   code,
-		"duration":          duration,
-		"is_active":         false,
-		"is_abnormal":       isAbnormal,
+// BatchMarkDisconnected 批量标记断连终态（CASE WHEN 单 SQL 合并，单条请求包长度 1 数组复用本方法）
+// 断连风暴下逐条 UPDATE 是 DB 写入洪峰主因（26w 断连 = 26w 条独立 UPDATE + 26w 个10s 超时 goroutine），攒批后合并为单条大 SQL；与 BatchUpdateHeartbeats 同模式：
+// 单 SQL 原子无需事务、ELSE 保列值、三方言通吃（MySQL/PG/CockroachDB）
+// 写 duration/disconnected_at/is_abnormal 等会话终态字段，供 FinalizeOnDisconnect 读 duration 算终评；
+// connectedAt 由调用方从内存 Client 快照带入（省前置 SELECT）；IN 影响 0 行（记录已被清理）静默返回。
+// is_active 全批统一 false 走普通 SET；其余终态字段逐条不同走 CASE WHEN；
+// 批内同连接去重保留最后一条（断连是单次事件，终态以最后一次为准）
+func (r *ConnectionStore) BatchMarkDisconnected(ctx context.Context, entries []*models.DisconnectionEntry) error {
+	if len(entries) == 0 {
+		return nil
 	}
 
-	return r.getDB(ctx).
-		Where("connection_id = ?", connectionID).
-		Updates(updates).Error
+	// 去重保留最后：后续 entry 覆盖前者（map 天然后写覆盖）
+	deduped := make(map[string]*models.DisconnectionEntry, len(entries))
+	for _, e := range entries {
+		deduped[e.ConnectionID] = e
+	}
+
+	table := r.tableName
+	if table == "" {
+		table = (&models.ConnectionRecord{}).TableName()
+	}
+
+	var sb strings.Builder
+	// 参数预估：5 列 CASE WHEN 各 2/条 + IN 1/条
+	args := make([]interface{}, 0, len(deduped)*11)
+	sb.WriteString("UPDATE ")
+	sb.WriteString(table)
+	sb.WriteString(" SET is_active = false")
+
+	// 五个终态字段共用同一 WHEN 骨架，写作子函数避免五段近似代码散落重复
+	appendTermCase := func(col string, value func(e *models.DisconnectionEntry) interface{}) {
+		sb.WriteByte(',')
+		sb.WriteString(col)
+		sb.WriteString(" = CASE connection_id")
+		for cid, e := range deduped {
+			sb.WriteString(" WHEN ? THEN ?")
+			args = append(args, cid, value(e))
+		}
+		sb.WriteString(" ELSE ")
+		sb.WriteString(col)
+		sb.WriteString(" END")
+	}
+	appendTermCase("disconnected_at", func(e *models.DisconnectionEntry) interface{} { return e.DisconnectedAt })
+	appendTermCase("disconnect_reason", func(e *models.DisconnectionEntry) interface{} { return string(e.Reason) })
+	appendTermCase("disconnect_code", func(e *models.DisconnectionEntry) interface{} { return e.Code })
+	appendTermCase("duration", func(e *models.DisconnectionEntry) interface{} {
+		// 与单条 MarkDisconnected 同语义：connectedAt 零值时 duration 为 0
+		if e.ConnectedAt.IsZero() {
+			return int64(0)
+		}
+		return int64(e.DisconnectedAt.Sub(e.ConnectedAt).Seconds())
+	})
+	appendTermCase("is_abnormal", func(e *models.DisconnectionEntry) interface{} {
+		// 与单条路径同判定：客户端主动断/服务端正常关停不算异常
+		return e.Reason != models.DisconnectReasonClientRequest && e.Reason != models.DisconnectReasonServerShutdown
+	})
+
+	sb.WriteString(" WHERE connection_id IN (")
+	first := true
+	for cid := range deduped {
+		if !first {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('?')
+		args = append(args, cid)
+		first = false
+	}
+	sb.WriteString(")")
+
+	return r.db.WithContext(ctx).Exec(sb.String(), args...).Error
 }
 
 // BatchUpdateHeartbeats 批量更新心跳时间戳（connect 表 last_ping_at/last_pong_at）

@@ -118,6 +118,15 @@ func (h *Hub) GetConnectionQualityRepository() spi.ConnectionQualityStore {
 // GetConnectionRecordRepo 连接记录仓储
 func (h *Hub) GetConnectionRecordRepo() spi.ConnectionStore { return h.connectionStore }
 
+// GetDisconnectionBatcher 断连终态攒批器（连接域记录管理器消费，
+// 正常注销路径的断连终态经攒批合并落库；编排层未构造批处理器时返回 nil）
+func (h *Hub) GetDisconnectionBatcher() connection.DisconnectionSubmitter {
+	if h.batcherMgr == nil {
+		return nil
+	}
+	return h.batcherMgr.DisconnectionBatcher()
+}
+
 // GetWorkloadStore 客服负载存储（未注入时调用方须报错而非 no-op）
 func (h *Hub) GetWorkloadStore() spi.WorkloadStore { return h.workloadStore }
 

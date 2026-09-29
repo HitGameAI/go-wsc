@@ -316,8 +316,8 @@ func (h *Hub) handleUnregister(client *models.Client) {
 		})
 	}
 
-	// 标记连接断开记录（提交到记录池，可丢弃）
+	// 标记连接断开记录（提交到记录池，可丢弃；池内再经攒批队列合并落库）
 	h.workerPool.TrySubmitRecord(func() {
-		h.recordMgr.MarkDisconnected(ctx, client)
+		h.recordMgr.MarkDisconnected(client)
 	})
 }

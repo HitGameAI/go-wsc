@@ -91,40 +91,61 @@ func (m *RecordManager) Save(ctx context.Context, record *models.ConnectionRecor
 		})
 }
 
-// MarkDisconnected 标记连接为已断开（仓储未注入时 no-op）
-func (m *RecordManager) MarkDisconnected(ctx context.Context, client *models.Client) {
-	if m.store() == nil {
+// disconnectionShutdownChunkSize 停机批量直调的单块上限
+// 每条 entry 展开 11 个 SQL 参数（5 列 CASE WHEN 各 2 + IN 1），500 条即 5.5k
+// 参数，控制在三方言占位符上限内（PG 系 65535，MySQL max_allowed_packet 语境下亦安全）
+const disconnectionShutdownChunkSize = 500
+
+// MarkDisconnected 标记连接为已断开（攒批路径，batcher 未注入时 no-op）
+// 构造 DisconnectionEntry 快照提交到 DisconnectionBatcher，由后台攒批合并为
+// CASE WHEN 单 SQL 落库；快照在断连瞬间冻结 DisconnectedAt/ConnectedAt，
+// flush 延迟不虚增 duration；队列满丢弃与原记录池可丢弃语义一致
+func (m *RecordManager) MarkDisconnected(client *models.Client) {
+	batcher := m.host.GetDisconnectionBatcher()
+	if batcher == nil {
 		return
 	}
-	syncx.Go(ctx).
-		WithTimeout(10 * time.Second).
-		OnError(func(err error) {
-			m.logger.WarnContextKV(ctx, "标记连接断开失败",
-				"connection_id", client.ID,
-				"error", err,
-			)
-		}).
-		ExecWithContext(func(ctx context.Context) error {
-			return m.store().MarkDisconnected(ctx, client.ID, client.ConnectedAt, models.DisconnectReasonClientRequest, 0)
-		})
+	if !batcher.Submit(&models.DisconnectionEntry{
+		ConnectionID:   client.ID,
+		ConnectedAt:    client.ConnectedAt,
+		DisconnectedAt: time.Now(),
+		Reason:         models.DisconnectReasonClientRequest,
+	}) {
+		m.logger.DebugKV("断连终态提交丢弃（攒批队列满）",
+			"connection_id", client.ID,
+		)
+	}
 }
 
 // MarkDisconnectedBatch 停机批量标记连接断开（仓储未注入时 no-op）
 // 与单连接路径的差异：reason 为 ServerShutdown + 关闭码 1001（客户端据此识别
-// 服务端主动离开并重连），并行同步执行（不逐条 syncx.Go，停机路径需限时完成）
+// 服务端主动离开并重连）；不走攒批队列而是分块同步直调 BatchMarkDisconnected——
+// 停机路径需在本方法返回后立即被 FinalizeOnDisconnect 读 duration 算终评，保序优先
 func (m *RecordManager) MarkDisconnectedBatch(clients []*models.Client) {
-	if m.store() == nil {
+	if m.store() == nil || len(clients) == 0 {
 		return
 	}
-	syncx.ParallelForEachSlice(clients, func(i int, client *models.Client) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := m.store().MarkDisconnected(ctx, client.ID, client.ConnectedAt, models.DisconnectReasonServerShutdown, 1001); err != nil {
-			m.logger.DebugContextKV(client.Context, "shutdown: 更新连接断开记录失败",
-				"client_id", client.ID,
-				"user_id", client.UserID,
+	now := time.Now()
+	entries := make([]*models.DisconnectionEntry, len(clients))
+	for i, client := range clients {
+		entries[i] = &models.DisconnectionEntry{
+			ConnectionID:   client.ID,
+			ConnectedAt:    client.ConnectedAt,
+			DisconnectedAt: now,
+			Reason:         models.DisconnectReasonServerShutdown,
+			Code:           1001,
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for start := 0; start < len(entries); start += disconnectionShutdownChunkSize {
+		end := min(start+disconnectionShutdownChunkSize, len(entries))
+		if err := m.store().BatchMarkDisconnected(ctx, entries[start:end]); err != nil {
+			m.logger.WarnContextKV(ctx, "shutdown: 批量标记连接断开失败",
+				"chunk_size", end-start,
 				"error", err,
 			)
 		}
-	})
+	}
 }

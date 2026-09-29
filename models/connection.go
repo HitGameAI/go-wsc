@@ -85,19 +85,6 @@ func (c *ConnectionRecord) CalculateDuration() {
 	}
 }
 
-// MarkDisconnected 标记为已断开
-func (c *ConnectionRecord) MarkDisconnected(reason DisconnectReason, code int) {
-	now := time.Now()
-	c.DisconnectedAt = &now
-	c.DisconnectReason = string(reason)
-	c.DisconnectCode = code
-	c.CalculateDuration()
-
-	// 判断是否异常断开
-	c.IsAbnormal = reason != DisconnectReasonClientRequest &&
-		reason != DisconnectReasonServerShutdown
-}
-
 // IsOnline 判断是否在线
 func (c *ConnectionRecord) IsOnline() bool {
 	return c.IsActive && c.DisconnectedAt == nil

@@ -79,8 +79,9 @@ func (f *fakeQualityStore) errUpdatesSnapshot() []*models.ErrorUpdateEntry {
 type fakeConnStore struct {
 	spi.ConnectionStore // 未覆盖的方法调用即 panic
 
-	mu         sync.Mutex
-	heartbeats []*models.HeartbeatUpdateEntry
+	mu             sync.Mutex
+	heartbeats     []*models.HeartbeatUpdateEntry
+	disconnections []*models.DisconnectionEntry
 }
 
 func (f *fakeConnStore) BatchUpdateHeartbeats(_ context.Context, entries []*models.HeartbeatUpdateEntry) error {
@@ -94,6 +95,20 @@ func (f *fakeConnStore) heartbeatsSnapshot() []*models.HeartbeatUpdateEntry {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]*models.HeartbeatUpdateEntry(nil), f.heartbeats...)
+}
+
+// BatchMarkDisconnected 批量标记断连终态（断连攒批 flush 消费）
+func (f *fakeConnStore) BatchMarkDisconnected(_ context.Context, entries []*models.DisconnectionEntry) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.disconnections = append(f.disconnections, entries...)
+	return nil
+}
+
+func (f *fakeConnStore) disconnectionsSnapshot() []*models.DisconnectionEntry {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*models.DisconnectionEntry(nil), f.disconnections...)
 }
 
 // fakeMessageSink 消息记录仓储替身

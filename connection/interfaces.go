@@ -75,6 +75,15 @@ type LifecycleHost interface {
 	SendToClient(ctx context.Context, client *models.Client, msg *models.HubMessage)
 }
 
+// DisconnectionSubmitter 断连终态攒批提交端口（消费者侧端口：Hub 实现）
+//
+// 正常注销路径的断连终态经攒批合并落库（CASE WHEN 单 SQL），替代逐条 UPDATE + 每断一连一个超时 goroutine 直打 DB 的写放大路径
+type DisconnectionSubmitter interface {
+	// Submit 非阻塞提交断连终态条目（队列满时返回 false，
+	// 与记录池可丢弃语义一致，仅影响审计统计精度）
+	Submit(entry *models.DisconnectionEntry) bool
+}
+
 // RecordHost 连接记录子域所需的 Hub 能力面
 //
 // 仓储经端口动态读取而非构造期快照：SetConnectionRecordRepository 支持
@@ -84,4 +93,6 @@ type RecordHost interface {
 	GetLogger() spi.Logger
 	// GetConnectionRecordRepo 连接记录仓储（未注入返回 nil，调用方自行降级）
 	GetConnectionRecordRepo() spi.ConnectionStore
+	// GetDisconnectionBatcher 断连终态攒批器（未注入返回 nil，调用方自行降级）
+	GetDisconnectionBatcher() DisconnectionSubmitter
 }

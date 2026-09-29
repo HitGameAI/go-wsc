@@ -110,6 +110,17 @@ type ErrorUpdateEntry struct {
 	LastErrorAt  time.Time
 }
 
+// DisconnectionEntry 断连终态条目（由连接记录仓库批量消费）
+// 快照语义：断连瞬间冻结 DisconnectedAt/ConnectedAt，flush 延迟不虚增 duration；
+// 同一连接重复提交时去重保留最后一条（断连是单次事件，终态以最后一次为准）
+type DisconnectionEntry struct {
+	ConnectionID   string
+	ConnectedAt    time.Time
+	DisconnectedAt time.Time
+	Reason         DisconnectReason
+	Code           int
+}
+
 // ConnectionQueryOptions 连接查询选项
 type ConnectionQueryOptions struct {
 	UserID     string // 用户ID过滤

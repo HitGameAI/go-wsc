@@ -46,7 +46,7 @@ func (f *fakeManagerHost) NotifyObserversDirect(msg *models.HubMessage, _ string
 var _ Host = (*fakeManagerHost)(nil)
 var _ ObserverNotifier = (*fakeManagerHost)(nil)
 
-// TestNewManagerConstructsAllComponents 验证 nil 配置下五个组件全部构造成功
+// TestNewManagerConstructsAllComponents 验证 nil 配置下七个组件全部构造成功
 func TestNewManagerConstructsAllComponents(t *testing.T) {
 	host := &fakeManagerHost{fakeBatchWriter: newFakeBatchWriter()}
 	m := NewManager(host, host, nil)
@@ -56,10 +56,12 @@ func TestNewManagerConstructsAllComponents(t *testing.T) {
 	assert.NotNil(t, m.HeartbeatStats())
 	assert.NotNil(t, m.MessageStats())
 	assert.NotNil(t, m.ObserverNotify())
+	assert.NotNil(t, m.DisconnectionBatcher())
 }
 
 // TestManagerStopRecordsFlushesPending 验证 StopRecords 冲刷停机前提交的数据：
-// 状态更新落 BatchUpdateStatus、记录 outbox 落 CreateBatch，停机后 Submit 拒绝
+// 状态更新落 BatchUpdateStatus、记录 outbox 落 CreateBatch、断连终态落
+// BatchMarkDisconnected，停机后 Submit 拒绝
 func TestManagerStopRecordsFlushesPending(t *testing.T) {
 	host := &fakeManagerHost{fakeBatchWriter: newFakeBatchWriter()}
 	m := NewManager(host, host, nil)
@@ -75,6 +77,13 @@ func TestManagerStopRecordsFlushesPending(t *testing.T) {
 		Receiver:  "u-1",
 		Status:    models.MessageSendStatusSuccess,
 	}))
+	// 提交一条断连终态（unregister 风暴在连接清理期间发生，StopRecords 才停）
+	require.True(t, m.DisconnectionBatcher().Submit(&models.DisconnectionEntry{
+		ConnectionID:   "c-1",
+		ConnectedAt:    time.Now().Add(-time.Minute),
+		DisconnectedAt: time.Now(),
+		Reason:         models.DisconnectReasonClientRequest,
+	}))
 
 	m.StopRecords()
 
@@ -85,6 +94,19 @@ func TestManagerStopRecordsFlushesPending(t *testing.T) {
 	created := host.sink.createdSnapshot()
 	require.Len(t, created, 1)
 	assert.Equal(t, "m-1", created[0].MessageID)
+
+	disconnections := host.records.disconnectionsSnapshot()
+	require.Len(t, disconnections, 1, "停机前提交的断连终态应被 flush 落库")
+	assert.Equal(t, "c-1", disconnections[0].ConnectionID)
+
+	// Stop 后 Submit 不 panic（队列未关闭，条目入队后无 worker 消费，静默滞留）
+	require.NotPanics(t, func() {
+		m.DisconnectionBatcher().Submit(&models.DisconnectionEntry{
+			ConnectionID:   "c-late",
+			DisconnectedAt: time.Now(),
+		})
+	})
+	assert.Len(t, host.records.disconnectionsSnapshot(), 1, "Stop 后滞留条目不应再落库")
 }
 
 // TestManagerStopTrackingFlushesHeartbeat 验证 StopTracking 冲刷停机前

@@ -4,11 +4,12 @@
  * @LastEditors: kamalyes 501893067@qq.com
  * @LastEditTime: 2026-09-23 09:21:00
  * @FilePath: \go-wsc\batcher\manager.go
- * @Description: 批处理器域管理器 —— 六个攒批组件的统一构造与停机编排
+ * @Description: 批处理器域管理器 —— 七个攒批组件的统一构造与停机编排
  *
  * 编排层只持一个 Manager 引用，组件构造参数解析与停机编排放归本域：
  * - 记录 outbox 复用 MessageStatus 攒批参数（write-ahead INSERT 与状态
  *   UPDATE 同节奏，flush 间隔即 ACK 超时注册延后的上界）
+ * - 断连终态攒批用包级常量参数（连接生命周期确定性事件，无需配置化）
  * - 停机分两段：StopTracking（连接清理前）与 StopRecords（连接清理后，
  *   先 outbox 后 statusUpdater，保 INSERT→UPDATE 落库顺序）
  *
@@ -21,14 +22,15 @@ import (
 	wscconfig "github.com/kamalyes/go-config/pkg/wsc"
 )
 
-// Manager 批处理器域管理器：持有六个攒批组件并提供域内访问器
+// Manager 批处理器域管理器：持有七个攒批组件并提供域内访问器
 type Manager struct {
-	statusUpdater  *MessageStatusUpdater
-	recordOutbox   *MessageRecordOutbox
-	heartbeatStats *HeartbeatStatsUpdater
-	messageStats   *MessageStatsBatcher
-	errorStats     *ErrorStatsBatcher
-	observerNotify *ObserverNotificationBatcher
+	statusUpdater        *MessageStatusUpdater
+	recordOutbox         *MessageRecordOutbox
+	heartbeatStats       *HeartbeatStatsUpdater
+	messageStats         *MessageStatsBatcher
+	errorStats           *ErrorStatsBatcher
+	observerNotify       *ObserverNotificationBatcher
+	disconnectionBatcher *DisconnectionBatcher
 }
 
 // NewManager 构造全部批处理器并启动后台 flush 协程
@@ -41,12 +43,13 @@ func NewManager(host Host, observerNotify ObserverNotifier, cfg *wscconfig.Batch
 	errStats := cfg.GetErrorStatsParams()
 	obsNotify := cfg.GetObserverNotifyParams()
 	return &Manager{
-		statusUpdater:  NewMessageStatusUpdater(host, msgStatus.QueueSize, msgStatus.BatchSize, msgStatus.FlushInterval),
-		recordOutbox:   NewMessageRecordOutbox(host, msgStatus.QueueSize, msgStatus.BatchSize, msgStatus.FlushInterval),
-		heartbeatStats: NewHeartbeatStatsUpdater(host, hbStats.QueueSize, hbStats.BatchSize, hbStats.FlushInterval),
-		messageStats:   NewMessageStatsBatcher(host, msgStats.QueueSize, msgStats.BatchSize, msgStats.FlushInterval),
-		errorStats:     NewErrorStatsBatcher(host, errStats.QueueSize, errStats.BatchSize, errStats.FlushInterval),
-		observerNotify: NewObserverNotificationBatcher(observerNotify, obsNotify.QueueSize, obsNotify.BatchSize, obsNotify.FlushInterval),
+		statusUpdater:        NewMessageStatusUpdater(host, msgStatus.QueueSize, msgStatus.BatchSize, msgStatus.FlushInterval),
+		recordOutbox:         NewMessageRecordOutbox(host, msgStatus.QueueSize, msgStatus.BatchSize, msgStatus.FlushInterval),
+		heartbeatStats:       NewHeartbeatStatsUpdater(host, hbStats.QueueSize, hbStats.BatchSize, hbStats.FlushInterval),
+		messageStats:         NewMessageStatsBatcher(host, msgStats.QueueSize, msgStats.BatchSize, msgStats.FlushInterval),
+		errorStats:           NewErrorStatsBatcher(host, errStats.QueueSize, errStats.BatchSize, errStats.FlushInterval),
+		observerNotify:       NewObserverNotificationBatcher(observerNotify, obsNotify.QueueSize, obsNotify.BatchSize, obsNotify.FlushInterval),
+		disconnectionBatcher: NewDisconnectionBatcher(host),
 	}
 }
 
@@ -68,6 +71,9 @@ func (m *Manager) ErrorStats() *ErrorStatsBatcher { return m.errorStats }
 // ObserverNotify 观察者通知批量处理器
 func (m *Manager) ObserverNotify() *ObserverNotificationBatcher { return m.observerNotify }
 
+// DisconnectionBatcher 断连终态批量更新器
+func (m *Manager) DisconnectionBatcher() *DisconnectionBatcher { return m.disconnectionBatcher }
+
 // StopTracking 停止心跳统计 / 消息统计 / 错误统计 / 观察者通知批处理器
 // 连接清理前调用，Stop 内部 flush 剩余数据并等待完成
 func (m *Manager) StopTracking() {
@@ -77,10 +83,12 @@ func (m *Manager) StopTracking() {
 	m.observerNotify.Stop()
 }
 
-// StopRecords 停止记录 outbox 与状态更新器（连接清理后调用）
+// StopRecords 停止断连终态 / 记录 outbox 与状态更新器（连接清理后调用）
+// 断连终态须待本段：unregister 风暴的 Submit 发生在连接清理期间（StopTracking 之后）；
 // 先 outbox 后 statusUpdater：保 INSERT→UPDATE 落库顺序，避免 UPDATE 扑空；
 // 在 Hub cancel 之前调用，确保 flush 时 h.ctx 仍然有效
 func (m *Manager) StopRecords() {
+	m.disconnectionBatcher.Stop()
 	m.recordOutbox.Stop()
 	m.statusUpdater.Stop()
 }

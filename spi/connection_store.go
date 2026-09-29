@@ -32,10 +32,12 @@ type ConnectionStore interface {
 	// Upsert 创建或更新连接记录（首次连接创建，重连时更新）
 	Upsert(ctx context.Context, record *models.ConnectionRecord) error
 
-	// MarkDisconnected 标记连接为已断开（写 duration/disconnected_at/is_abnormal 供质量终评读）
-	// connectedAt 由调用方从内存 Client 带入（省去一次 SELECT 查记录的开销，
-	// 断连风暴下每断一连接少 1 次 DB 往返）；记录不存在时实现方静默返回
-	MarkDisconnected(ctx context.Context, connectionID string, connectedAt time.Time, reason models.DisconnectReason, code int) error
+	// BatchMarkDisconnected 批量标记断连终态（CASE WHEN 单 SQL 合并）
+	// 断连终态唯一写入口：正常注销经 DisconnectionBatcher 攒批 flush，停机路径分块直调；
+	// 写 duration/disconnected_at/is_abnormal 供质量终评（FinalizeOnDisconnect）读，
+	// connectedAt 由调用方从内存 Client 快照带入（省前置 SELECT）；
+	// IN 影响 0 行（记录已被清理）静默返回；批内同连接去重保留最后（终态以最后一次为准）
+	BatchMarkDisconnected(ctx context.Context, entries []*models.DisconnectionEntry) error
 
 	// BatchUpdateHeartbeats 批量更新心跳时间戳（connect 表 last_ping_at/last_pong_at，单事务）
 	BatchUpdateHeartbeats(ctx context.Context, entries []*models.HeartbeatUpdateEntry) error
