@@ -17,11 +17,13 @@ package gormadapter
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"time"
 
 	wscconfig "github.com/kamalyes/go-config/pkg/wsc"
 	"github.com/kamalyes/go-logger"
 	sqlbuilder "github.com/kamalyes/go-sqlbuilder/repository"
+	"github.com/kamalyes/go-toolbox/pkg/syncx"
 	"github.com/kamalyes/go-wsc/constants"
 	"github.com/kamalyes/go-wsc/models"
 	"github.com/kamalyes/go-wsc/spi"
@@ -39,15 +41,22 @@ type ConnectionQualityStore struct {
 }
 
 // NewConnectionQualityStore 创建连接质量仓储实例
-// config 复用 ConnectionRecord 配置（清理等，暂不启用质量表自动清理，留空实现）
+// config 复用 ConnectionRecord 配置：质量表随连接记录同窗口清理（按 last_active_at），
+// 否则每次连接一行只增不减，高频 UPDATE 会随表膨胀越来越慢
 func NewConnectionQualityStore(db *gorm.DB, config *wscconfig.ConnectionRecord, log logger.ILogger) *ConnectionQualityStore {
-	_, cancel := context.WithCancel(context.Background())
-	_ = config // 质量表清理策略待定，暂不启用
-	return &ConnectionQualityStore{
+	ctx, cancel := context.WithCancel(context.Background())
+
+	repo := &ConnectionQualityStore{
 		db:         db,
 		logger:     log,
 		cancelFunc: cancel,
 	}
+
+	if config != nil && config.EnableAutoCleanup && config.CleanupDaysAgo > 0 {
+		go repo.startCleanupScheduler(ctx, config.CleanupDaysAgo)
+	}
+
+	return repo
 }
 
 // WithTableName 设置自定义表名（用于测试隔离）
@@ -318,12 +327,60 @@ func (r *ConnectionQualityStore) GetFrequentReconnectConnections(ctx context.Con
 	return records, err
 }
 
-// Close 关闭仓库
+// Close 关闭仓库，停止后台清理任务
 func (r *ConnectionQualityStore) Close() error {
 	if r.cancelFunc != nil {
 		r.cancelFunc()
 	}
 	return nil
+}
+
+// CleanupInactiveRecords 清理指定时间前不再活跃的质量记录（硬删：历史质量指标无回溯消费方）
+// 断连后心跳停止，last_active_at 停在最后一次活跃时刻，按它清理与连接记录同窗口
+func (r *ConnectionQualityStore) CleanupInactiveRecords(ctx context.Context, before time.Time) (int64, error) {
+	result := r.getDB(ctx).
+		Where("last_active_at < ?", before).
+		Delete(&models.ConnectionQuality{})
+
+	if result.Error != nil {
+		return 0, result.Error
+	}
+
+	return result.RowsAffected, nil
+}
+
+// startCleanupScheduler 启动定时清理任务（使用 EventLoop，每天执行一次，与 ConnectionStore 同模式）
+func (r *ConnectionQualityStore) startCleanupScheduler(ctx context.Context, daysAgo int) {
+	// 立即执行一次清理
+	r.cleanupOldData(ctx, daysAgo)
+
+	syncx.NewEventLoop(ctx).
+		OnTicker(24*time.Hour, func() {
+			r.cleanupOldData(ctx, daysAgo)
+		}).
+		OnPanic(func(rec any) {
+			r.logger.Errorf("⚠️ 质量记录清理任务 panic: %v, stack: %s", rec, debug.Stack())
+		}).
+		OnShutdown(func() {
+			r.logger.Info("🛑 质量记录清理任务已停止")
+		}).
+		Run()
+}
+
+// cleanupOldData 清理N天前的非活跃质量记录
+func (r *ConnectionQualityStore) cleanupOldData(ctx context.Context, daysAgo int) {
+	if daysAgo <= 0 {
+		return
+	}
+
+	before := time.Now().AddDate(0, 0, -daysAgo)
+
+	deleted, err := r.CleanupInactiveRecords(ctx, before)
+	if err != nil {
+		r.logger.Warnf("⚠️ 清理历史质量记录失败: %v", err)
+	} else if deleted > 0 {
+		r.logger.Infof("🧹 已清理 %d 天前的非活跃质量记录，删除 %d 条", daysAgo, deleted)
+	}
 }
 
 // 编译期断言：repository 实现必须满足 spi 契约（Phase 4 迁仓后适配器同样受此约束）
