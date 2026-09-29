@@ -148,25 +148,20 @@ func (r *ConnectionQualityStore) BatchUpdateHeartbeats(ctx context.Context, entr
 
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, entry := range entries {
-			// 刷新活跃时间（供清理任务判断，心跳时间戳本身落 connect 表）
+			// 同一行（connection_id 命中）的两类字段合并为一次 UPDATE：
+			// 活跃时间（供清理任务判断，心跳时间戳本身落 connect 表）+ Ping 统计（移动平均，与原 ConnectionStore 实现一致）
+			// 两次合并为一次后事务内语句数减半，缩短批量心跳事务持锁时间（高并发下显著缓解连接池排队）
 			updates := make(map[string]any)
 			if entry.PingTime != nil {
 				updates["last_active_at"] = entry.PingTime
 			}
+			if entry.PingMs > 0 {
+				updates["average_ping_ms"] = gorm.Expr("CASE WHEN average_ping_ms > 0 THEN average_ping_ms * 0.7 + ? * 0.3 ELSE ? END", entry.PingMs, entry.PingMs)
+				updates["max_ping_ms"] = gorm.Expr("CASE WHEN max_ping_ms = 0 OR max_ping_ms < ? THEN ? ELSE max_ping_ms END", entry.PingMs, entry.PingMs)
+				updates["min_ping_ms"] = gorm.Expr("CASE WHEN min_ping_ms = 0 OR min_ping_ms > ? THEN ? ELSE min_ping_ms END", entry.PingMs, entry.PingMs)
+			}
 			if len(updates) > 0 {
 				if err := r.newQuery(tx).Where("connection_id = ?", entry.ConnectionID).Updates(updates).Error; err != nil {
-					continue
-				}
-			}
-
-			// 更新 Ping 统计（移动平均，与原 ConnectionStore 实现一致）
-			if entry.PingMs > 0 {
-				pingUpdates := map[string]any{
-					"average_ping_ms": gorm.Expr("CASE WHEN average_ping_ms > 0 THEN average_ping_ms * 0.7 + ? * 0.3 ELSE ? END", entry.PingMs, entry.PingMs),
-					"max_ping_ms":     gorm.Expr("CASE WHEN max_ping_ms = 0 OR max_ping_ms < ? THEN ? ELSE max_ping_ms END", entry.PingMs, entry.PingMs),
-					"min_ping_ms":     gorm.Expr("CASE WHEN min_ping_ms = 0 OR min_ping_ms > ? THEN ? ELSE min_ping_ms END", entry.PingMs, entry.PingMs),
-				}
-				if err := r.newQuery(tx).Where("connection_id = ?", entry.ConnectionID).Updates(pingUpdates).Error; err != nil {
 					continue
 				}
 			}
