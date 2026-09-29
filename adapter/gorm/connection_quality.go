@@ -255,58 +255,170 @@ func (r *ConnectionQualityStore) BatchUpdateHeartbeats(ctx context.Context, entr
 	return r.db.WithContext(ctx).Exec(sb.String(), args...).Error
 }
 
-// BatchIncrementStats 批量递增消息/字节统计（单事务）
+// BatchIncrementStats 批量递增消息/字节统计（CASE WHEN 单 SQL 合并）
+// 旧实现为事务内逐条 UPDATE（批 200 = 200 条 SQL + 事务开销），且 5s flush ctx 到期后
+// 循环内剩余条目立即失败（ms:0 context deadline exceeded）并逐条打 ERROR 日志，
+// 形成超时雪崩与日志风暴；单 SQL 化后整批合并为一条自增语句，整体成功或失败
+// 自增语义经「列 + CASE」实现：col = col + CASE connection_id WHEN ? THEN ? ELSE 0 END，
+// 无增量的行加 0 不变；批内同连接多条 entry 先合并累加（等价逐条自增的最终状态）
 func (r *ConnectionQualityStore) BatchIncrementStats(ctx context.Context, entries []*models.StatsIncrementEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
 
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		for _, entry := range entries {
-			updates := make(map[string]any)
-			if entry.MessagesSent > 0 {
-				updates["messages_sent"] = gorm.Expr("messages_sent + ?", entry.MessagesSent)
-			}
-			if entry.MessagesReceived > 0 {
-				updates["messages_received"] = gorm.Expr("messages_received + ?", entry.MessagesReceived)
-			}
-			if entry.BytesSent > 0 {
-				updates["bytes_sent"] = gorm.Expr("bytes_sent + ?", entry.BytesSent)
-			}
-			if entry.BytesReceived > 0 {
-				updates["bytes_received"] = gorm.Expr("bytes_received + ?", entry.BytesReceived)
-			}
-			if len(updates) > 0 {
-				if err := r.newQuery(tx).Where("connection_id = ?", entry.ConnectionID).Updates(updates).Error; err != nil {
-					continue
-				}
+	// 批内同连接合并：四列各自累加
+	type statPatch struct{ msgSent, msgRecv, bytesSent, bytesRecv int64 }
+	patches := make(map[string]*statPatch, len(entries))
+	for _, e := range entries {
+		p := patches[e.ConnectionID]
+		if p == nil {
+			p = &statPatch{}
+			patches[e.ConnectionID] = p
+		}
+		p.msgSent += e.MessagesSent
+		p.msgRecv += e.MessagesReceived
+		p.bytesSent += e.BytesSent
+		p.bytesRecv += e.BytesReceived
+	}
+
+	// 存在增量的列才进 SET（entry 全为零增量的列跳过）
+	var ms, mr, bs, br int
+	for _, p := range patches {
+		if p.msgSent > 0 {
+			ms++
+		}
+		if p.msgRecv > 0 {
+			mr++
+		}
+		if p.bytesSent > 0 {
+			bs++
+		}
+		if p.bytesRecv > 0 {
+			br++
+		}
+	}
+	if ms+mr+bs+br == 0 {
+		return nil
+	}
+
+	table := r.tableName
+	if table == "" {
+		table = (&models.ConnectionQuality{}).TableName()
+	}
+
+	var sb strings.Builder
+	// 参数预估：每列 2/条 + updated_at 1 + IN 1/条
+	args := make([]interface{}, 0, (ms+mr+bs+br)*2+len(patches)+1)
+	sb.WriteString("UPDATE ")
+	sb.WriteString(table)
+	// 逐条 Updates 由 gorm 自动维护 updated_at，手写 SQL 显式保留同一行为
+	sb.WriteString(" SET updated_at = ?")
+	args = append(args, time.Now())
+
+	// 四列共用同一 WHEN 骨架（自增式 CASE，ELSE 0），写作子函数避免四段近似代码散落重复
+	appendIncrCase := func(col string, nonzero func(p *statPatch) int64, count int) {
+		if count == 0 {
+			return
+		}
+		sb.WriteByte(',')
+		sb.WriteString(col)
+		sb.WriteString(" = ")
+		sb.WriteString(col)
+		sb.WriteString(" + CASE connection_id")
+		for cid, p := range patches {
+			if v := nonzero(p); v > 0 {
+				sb.WriteString(" WHEN ? THEN ?")
+				args = append(args, cid, v)
 			}
 		}
-		return nil
-	})
+		sb.WriteString(" ELSE 0 END")
+	}
+	appendIncrCase("messages_sent", func(p *statPatch) int64 { return p.msgSent }, ms)
+	appendIncrCase("messages_received", func(p *statPatch) int64 { return p.msgRecv }, mr)
+	appendIncrCase("bytes_sent", func(p *statPatch) int64 { return p.bytesSent }, bs)
+	appendIncrCase("bytes_received", func(p *statPatch) int64 { return p.bytesRecv }, br)
+
+	sb.WriteString(" WHERE connection_id IN (")
+	first := true
+	for cid := range patches {
+		if !first {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('?')
+		args = append(args, cid)
+		first = false
+	}
+	sb.WriteString(")")
+
+	return r.db.WithContext(ctx).Exec(sb.String(), args...).Error
 }
 
-// BatchAddErrors 批量记录连接错误（单事务）
-// 同一连接的多次错误已由 batcher 在 flush 时合并（ErrorCount 为合并次数，LastError/LastErrorAt 为最新一次）；
-// 单条失败跳过（与 BatchIncrementStats 同语义），断连风暴下 N 次错误合并为 1 次事务
+// BatchAddErrors 批量记录连接错误（CASE WHEN 单 SQL 合并）
+// 同一连接的多次错误在攒批 flush 时合并：ErrorCount 累加，LastError/LastErrorAt 取最新一次；
+// error_count 为自增式 CASE（ELSE 0），last_error/last_error_at 为覆盖式 CASE（ELSE 保列值），
+// 与 BatchIncrementStats 同模式消除事务内逐条 UPDATE 的超时雪崩与日志风暴
 func (r *ConnectionQualityStore) BatchAddErrors(ctx context.Context, entries []*models.ErrorUpdateEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
 
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		for _, entry := range entries {
-			updates := map[string]any{
-				"error_count":   gorm.Expr("error_count + ?", entry.ErrorCount),
-				"last_error":    entry.LastError,
-				"last_error_at": entry.LastErrorAt,
-			}
-			if err := r.newQuery(tx).Where("connection_id = ?", entry.ConnectionID).Updates(updates).Error; err != nil {
-				continue
-			}
+	// 批内同连接合并：次数累加，最新错误覆盖
+	type errPatch struct {
+		count   int64
+		lastMsg string
+		lastAt  time.Time
+	}
+	patches := make(map[string]*errPatch, len(entries))
+	for _, e := range entries {
+		p := patches[e.ConnectionID]
+		if p == nil {
+			p = &errPatch{}
+			patches[e.ConnectionID] = p
 		}
-		return nil
-	})
+		p.count += e.ErrorCount
+		p.lastMsg = e.LastError
+		p.lastAt = e.LastErrorAt
+	}
+
+	table := r.tableName
+	if table == "" {
+		table = (&models.ConnectionQuality{}).TableName()
+	}
+
+	var sb strings.Builder
+	// 参数上限预估：error_count 2/条 + last_error 2/条 + last_error_at 2/条 + updated_at 1 + IN 1/条
+	args := make([]interface{}, 0, len(patches)*7+1)
+	sb.WriteString("UPDATE ")
+	sb.WriteString(table)
+	sb.WriteString(" SET updated_at = ?, error_count = error_count + CASE connection_id")
+	args = append(args, time.Now())
+	for cid, p := range patches {
+		sb.WriteString(" WHEN ? THEN ?")
+		args = append(args, cid, p.count)
+	}
+	sb.WriteString(" ELSE 0 END, last_error = CASE connection_id")
+	for cid, p := range patches {
+		sb.WriteString(" WHEN ? THEN ?")
+		args = append(args, cid, p.lastMsg)
+	}
+	sb.WriteString(" ELSE last_error END, last_error_at = CASE connection_id")
+	for cid, p := range patches {
+		sb.WriteString(" WHEN ? THEN ?")
+		args = append(args, cid, p.lastAt)
+	}
+	sb.WriteString(" ELSE last_error_at END WHERE connection_id IN (")
+	first := true
+	for cid := range patches {
+		if !first {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('?')
+		args = append(args, cid)
+		first = false
+	}
+	sb.WriteString(")")
+
+	return r.db.WithContext(ctx).Exec(sb.String(), args...).Error
 }
 
 // FinalizeOnDisconnect 断开终评
